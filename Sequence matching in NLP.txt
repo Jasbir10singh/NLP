@@ -1,0 +1,7 @@
+# matching in 2 set 
+s1 = " one two three four five"
+s2 = "three four five"
+count = len(s1)
+match_words = set(s1).intersection(set(s2))
+match = len(match_words)/count
+print(match)
