@@ -1,0 +1,1382 @@
+
+
+
+
+
+
+
+Topic Modeling for Fun and Profit
+
+
+
+
+
+
+In this notebook we'll
+•vectorize a streamed corpus
+•run topic modeling on streamed vectors, using gensim
+•explore how to choose, evaluate and tweak topic modeling parameters
+•persist trained models to disk, for later re-use
+
+
+
+
+
+
+In the previous notebook 1 - Streamed Corpora we used the 20newsgroups corpus to demonstrate data preprocessing and streaming.
+
+Now we'll switch to the English Wikipedia and do some topic modeling.
+
+
+
+In [1]: 
+
+
+
+# import and setup modules we'll be using in this notebook
+import logging
+import itertools
+
+import numpy as np
+import gensim
+
+logging.basicConfig(format='%(levelname)s : %(message)s', level=logging.INFO)
+logging.root.level = logging.INFO  # ipython sometimes messes up the logging setup; restore
+
+def head(stream, n=10):
+    """Convenience fnc: return the first `n` elements of the stream, as plain list."""
+    return list(itertools.islice(stream, n))
+
+
+
+
+
+
+
+Wikipedia corpus
+
+
+
+
+
+
+Let's use the now-familiar pattern of streaming over an entire Wikipedia dump, without unzipping the raw file:
+
+
+
+In [2]: 
+
+
+
+from gensim.utils import smart_open, simple_preprocess
+from gensim.corpora.wikicorpus import _extract_pages, filter_wiki
+from gensim.parsing.preprocessing import STOPWORDS
+
+def tokenize(text):
+    return [token for token in simple_preprocess(text) if token not in STOPWORDS]
+
+def iter_wiki(dump_file):
+    """Yield each article from the Wikipedia dump, as a `(title, tokens)` 2-tuple."""
+    ignore_namespaces = 'Wikipedia Category File Portal Template MediaWiki User Help Book Draft'.split()
+    for title, text, pageid in _extract_pages(smart_open(dump_file)):
+        text = filter_wiki(text)
+        tokens = tokenize(text)
+        if len(tokens) < 50 or any(title.startswith(ns + ':') for ns in ignore_namespaces):
+            continue  # ignore short articles and various meta-articles
+        yield title, tokens
+
+
+
+
+In [3]: 
+
+
+
+# only use simplewiki in this tutorial (fewer documents)
+# the full wiki dump is exactly the same format, but larger
+stream = iter_wiki('./data/simplewiki-20140623-pages-articles.xml.bz2')
+for title, tokens in itertools.islice(iter_wiki('./data/simplewiki-20140623-pages-articles.xml.bz2'), 8):
+    print title, tokens[:10]  # print the article title and its first ten tokens
+
+
+
+
+
+
+April [u'april', u'fourth', u'month', u'year', u'comes', u'march', u'days', u'april', u'begins', u'day']
+August [u'august', u'eighth', u'month', u'year', u'gregorian', u'calendar', u'coming', u'july', u'september', u'days']
+Art [u'painting', u'renoir', u'work', u'art', u'art', u'activity', u'creation', u'people', u'importance', u'attraction']
+A [u'page', u'letter', u'alphabet', u'indefinite', u'article', u'article', u'grammar', u'uses', u'disambiguation', u'letter']
+Air [u'air', u'fan', u'air', u'air', u'earth', u'atmosphere', u'clear', u'gas', u'living', u'things']
+Autonomous communities of Spain [u'spain', u'divided', u'parts', u'called', u'autonomous', u'communities', u'autonomous', u'means', u'autonomous', u'communities']
+Alan Turing [u'statue', u'alan', u'turing', u'rebuild', u'machine', u'alan', u'turing', u'alan', u'mathison', u'turing']
+Alanis Morissette [u'alanis', u'nadine', u'morissette', u'born', u'june', u'grammy', u'award', u'winning', u'canadian', u'american']
+
+
+
+
+
+
+
+
+Dictionaries
+
+
+
+
+
+
+Dictionaries are objects that map into raw text tokens (strings) from their numerical ids (integers). Example:
+
+
+
+In [4]: 
+
+
+
+id2word = {0: u'word', 2: u'profit', 300: u'another_word'}
+
+
+
+
+
+
+
+This mapping step is technically (not conceptually) necessary because most algorithms rely on numerical libraries that work with vectors indexed by integers, rather than by strings, and have to know the vector/matrix dimensionality in advance.
+
+The mapping can be constructed automatically by giving Dictionary class a stream of tokenized documents:
+
+
+
+In [5]: 
+
+
+
+doc_stream = (tokens for _, tokens in iter_wiki('./data/simplewiki-20140623-pages-articles.xml.bz2'))
+
+
+
+
+In [6]: 
+
+
+
+%time id2word_wiki = gensim.corpora.Dictionary(doc_stream)
+print(id2word_wiki)
+
+
+
+
+
+
+INFO:gensim.corpora.dictionary:adding document #0 to Dictionary(0 unique tokens: [])
+INFO:gensim.corpora.dictionary:adding document #10000 to Dictionary(148220 unique tokens: [u'fawn', u'\u03c9\u0431\u0440\u0430\u0434\u043e\u0432\u0430\u043d\u043d\u0430\u0467', u'refreshable', u'yollar\u0131', u'idaira']...)
+INFO:gensim.corpora.dictionary:adding document #20000 to Dictionary(225158 unique tokens: [u'biennials', u'sowela', u'mdbg', u'clottes', u'idaira']...)
+INFO:gensim.corpora.dictionary:adding document #30000 to Dictionary(286094 unique tokens: [u'biennials', u'sowela', u'mdbg', u'clottes', u'klatki']...)
+INFO:gensim.corpora.dictionary:adding document #40000 to Dictionary(375920 unique tokens: [u'biennials', u'sowela', u'mdbg', u'biysk', u'sermersheim']...)
+INFO:gensim.corpora.dictionary:built Dictionary(409138 unique tokens: [u'biennials', u'sowela', u'mdbg', u'biysk', u'sermersheim']...) from 48356 documents (total 10387233 corpus positions)
+
+
+
+
+
+CPU times: user 4min 30s, sys: 511 ms, total: 4min 30s
+Wall time: 4min 30s
+Dictionary(409138 unique tokens: [u'biennials', u'sowela', u'mdbg', u'biysk', u'sermersheim']...)
+
+
+
+
+
+
+
+
+The dictionary object now contains all words that appeared in the corpus, along with how many times they appeared. Let's filter out both very infrequent words and very frequent words (stopwords), to clear up resources as well as remove noise:
+
+
+
+In [7]: 
+
+
+
+# ignore words that appear in less than 20 documents or more than 10% documents
+id2word_wiki.filter_extremes(no_below=20, no_above=0.1)
+print(id2word_wiki)
+
+
+
+
+
+
+INFO:gensim.corpora.dictionary:keeping 26645 tokens which were in no less than 20 and no more than 4835 (=10.0%) documents
+INFO:gensim.corpora.dictionary:resulting dictionary: Dictionary(26645 unique tokens: [u'fawn', u'schlegel', u'sonja', u'woods', u'spiders']...)
+
+
+
+
+
+Dictionary(26645 unique tokens: [u'fawn', u'schlegel', u'sonja', u'woods', u'spiders']...)
+
+
+
+
+
+
+
+
+Exercise (5 min): Print all words and their ids from id2word_wiki where the word starts with "human".
+
+
+
+
+
+
+Note for advanced users: In fully online scenarios, where the documents can only be streamed once (no repeating the stream), we can't exhaust the document stream just to build a dictionary. In this case we can map strings directly into their integer hash, using a hashing function such as MurmurHash or MD5. This is called the "hashing trick". A dictionary built this way is more difficult to debug, because there may be hash collisions: multiple words represented by a single id. See the documentation of HashDictionary for more details.
+
+
+
+
+
+
+Vectorization
+
+
+
+
+
+
+A streamed corpus and a dictionary is all we need to create bag-of-words vectors:
+
+
+
+In [11]: 
+
+
+
+doc = "A blood cell, also called a hematocyte, is a cell produced by hematopoiesis and normally found in blood."
+bow = id2word_wiki.doc2bow(tokenize(doc))
+print(bow)
+
+
+
+
+
+
+[(10882, 2), (18120, 1), (21296, 1), (22828, 2)]
+
+
+
+
+
+In [12]: 
+
+
+
+print(id2word_wiki[10882])
+
+
+
+
+
+
+blood
+
+
+
+
+
+
+
+
+Let's wrap the entire dump, as a stream of bag-of-word vectors:
+
+
+
+In [13]: 
+
+
+
+class WikiCorpus(object):
+    def __init__(self, dump_file, dictionary, clip_docs=None):
+        """
+        Parse the first `clip_docs` Wikipedia documents from file `dump_file`.
+        Yield each document in turn, as a list of tokens (unicode strings).
+        
+        """
+        self.dump_file = dump_file
+        self.dictionary = dictionary
+        self.clip_docs = clip_docs
+    
+    def __iter__(self):
+        self.titles = []
+        for title, tokens in itertools.islice(iter_wiki(self.dump_file), self.clip_docs):
+            self.titles.append(title)
+            yield self.dictionary.doc2bow(tokens)
+    
+    def __len__(self):
+        return self.clip_docs
+
+# create a stream of bag-of-words vectors
+wiki_corpus = WikiCorpus('./data/simplewiki-20140623-pages-articles.xml.bz2', id2word_wiki)
+vector = next(iter(wiki_corpus))
+print(vector)  # print the first vector in the stream
+
+
+
+
+
+
+[(24, 1), (38, 1), (53, 1), (103, 1), (111, 1), (213, 3), (237, 1), (242, 2), (417, 1), (455, 3), (459, 1), (463, 1), (505, 1), (533, 1), (547, 3), (718, 1), (786, 1), (834, 1), (858, 2), (881, 1), (934, 2), (944, 1), (1191, 3), (1205, 1), (1233, 1), (1366, 1), (1426, 1), (1469, 2), (1477, 2), (1495, 2), (1540, 1), (1611, 1), (1732, 1), (1749, 1), (1823, 1), (1913, 3), (1953, 1), (2003, 1), (2042, 1), (2142, 1), (2143, 1), (2324, 1), (2336, 5), (2382, 9), (2390, 1), (2537, 1), (2576, 2), (2583, 1), (2602, 1), (2617, 1), (2657, 2), (2684, 1), (2721, 1), (2952, 1), (2966, 1), (3066, 2), (3182, 2), (3235, 1), (3331, 4), (3357, 1), (3359, 5), (3383, 1), (3412, 2), (3480, 1), (3484, 1), (3504, 1), (3542, 2), (3555, 2), (3575, 1), (3578, 1), (3598, 5), (3632, 1), (3636, 1), (3643, 1), (3668, 1), (3704, 1), (3747, 1), (3781, 1), (3793, 2), (3808, 2), (3814, 1), (3853, 1), (3947, 1), (3969, 4), (4004, 1), (4007, 1), (4018, 2), (4032, 2), (4048, 1), (4128, 1), (4197, 1), (4216, 1), (4219, 2), (4238, 1), (4254, 11), (4298, 1), (4350, 1), (4370, 1), (4388, 1), (4419, 1), (4439, 1), (4465, 1), (4496, 1), (4518, 4), (4558, 1), (4582, 2), (4587, 2), (4694, 1), (4698, 1), (4701, 1), (4703, 1), (4792, 1), (4853, 2), (4901, 8), (4907, 3), (5006, 2), (5061, 2), (5066, 1), (5116, 2), (5163, 1), (5183, 1), (5226, 2), (5262, 2), (5268, 2), (5381, 1), (5390, 1), (5431, 2), (5439, 2), (5509, 1), (5512, 1), (5526, 1), (5535, 2), (5608, 1), (5631, 1), (5641, 1), (5742, 1), (5761, 1), (5767, 3), (5773, 11), (5795, 1), (5804, 3), (5841, 2), (5852, 1), (5892, 1), (5975, 1), (6015, 1), (6121, 1), (6190, 1), (6199, 2), (6212, 1), (6227, 1), (6233, 1), (6242, 215), (6246, 1), (6247, 1), (6278, 1), (6358, 1), (6394, 1), (6544, 1), (6616, 1), (6629, 1), (6630, 1), (6715, 1), (6840, 4), (6882, 1), (6891, 2), (6907, 1), (6945, 4), (7034, 1), (7064, 1), (7083, 1), (7086, 2), (7252, 1), (7288, 1), (7343, 1), (7401, 8), (7461, 1), (7511, 1), (7542, 1), (7627, 1), (7664, 1), (7748, 1), (7839, 1), (7861, 3), (7899, 1), (8136, 3), (8175, 2), (8181, 1), (8186, 3), (8245, 1), (8255, 1), (8371, 1), (8430, 1), (8439, 1), (8467, 1), (8580, 5), (8609, 1), (8617, 1), (8622, 2), (8662, 1), (8674, 1), (8715, 1), (8723, 1), (8750, 2), (8761, 4), (8832, 1), (8881, 4), (8908, 1), (8956, 1), (8979, 1), (8981, 2), (9180, 3), (9200, 1), (9274, 1), (9380, 1), (9418, 4), (9424, 1), (9432, 1), (9433, 3), (9484, 3), (9495, 2), (9524, 1), (9546, 1), (9550, 1), (9760, 3), (9999, 1), (10068, 2), (10184, 6), (10188, 1), (10212, 1), (10271, 3), (10282, 1), (10285, 1), (10288, 1), (10308, 2), (10315, 4), (10378, 1), (10413, 4), (10484, 5), (10549, 1), (10576, 1), (10589, 1), (10590, 3), (10709, 1), (10715, 2), (10737, 1), (10781, 1), (10786, 2), (10850, 1), (10909, 1), (10960, 1), (10988, 1), (11009, 1), (11059, 1), (11060, 1), (11067, 1), (11148, 1), (11152, 1), (11166, 1), (11279, 1), (11352, 1), (11357, 1), (11467, 1), (11484, 1), (11555, 1), (11615, 1), (11724, 1), (11744, 1), (11774, 5), (11803, 1), (11830, 1), (11857, 2), (11899, 1), (11945, 1), (11970, 3), (12000, 3), (12057, 1), (12082, 1), (12093, 1), (12113, 1), (12185, 3), (12257, 6), (12288, 2), (12315, 2), (12355, 1), (12356, 6), (12375, 1), (12399, 2), (12514, 1), (12590, 1), (12599, 1), (12601, 1), (12606, 1), (12618, 1), (12619, 1), (12625, 1), (12706, 1), (12730, 2), (12770, 2), (12941, 1), (13020, 1), (13064, 1), (13163, 1), (13229, 2), (13288, 1), (13345, 1), (13450, 1), (13481, 1), (13503, 1), (13524, 3), (13547, 2), (13563, 6), (13582, 4), (13627, 1), (13630, 1), (13634, 1), (13666, 1), (13693, 2), (13715, 1), (13781, 1), (13823, 1), (13839, 1), (13856, 1), (13911, 1), (14040, 1), (14081, 3), (14145, 1), (14154, 1), (14159, 1), (14195, 1), (14320, 1), (14371, 1), (14379, 2), (14439, 3), (14455, 3), (14458, 1), (14601, 2), (14605, 1), (14682, 1), (14711, 1), (14775, 2), (14779, 1), (14815, 5), (14839, 1), (14843, 1), (14897, 1), (14908, 2), (14917, 3), (15006, 1), (15018, 1), (15039, 1), (15047, 1), (15092, 2), (15094, 1), (15137, 1), (15156, 1), (15179, 1), (15268, 2), (15275, 1), (15292, 1), (15299, 1), (15335, 4), (15378, 1), (15517, 3), (15543, 2), (15553, 1), (15612, 4), (15619, 1), (15623, 1), (15643, 2), (15766, 1), (15856, 2), (15873, 1), (15930, 2), (15981, 2), (16036, 5), (16053, 3), (16110, 1), (16255, 1), (16259, 1), (16317, 2), (16347, 1), (16387, 1), (16560, 2), (16568, 2), (16624, 2), (16687, 1), (16694, 1), (16705, 6), (16738, 1), (16886, 4), (16890, 1), (16945, 1), (16954, 1), (16999, 1), (17089, 1), (17160, 1), (17186, 1), (17191, 2), (17199, 1), (17244, 1), (17290, 1), (17364, 2), (17499, 1), (17518, 1), (17535, 1), (17706, 3), (17762, 1), (17899, 3), (17906, 8), (17918, 1), (17954, 2), (17965, 1), (17977, 1), (17982, 1), (18116, 1), (18215, 2), (18238, 1), (18322, 1), (18481, 2), (18516, 1), (18538, 3), (18541, 1), (18551, 1), (18561, 1), (18590, 1), (18593, 1), (18644, 3), (18710, 1), (18714, 1), (18724, 1), (18830, 1), (18835, 1), (18860, 1), (18871, 2), (18903, 2), (18942, 1), (18995, 1), (19000, 1), (19045, 1), (19053, 4), (19061, 1), (19097, 1), (19144, 1), (19164, 1), (19246, 1), (19256, 1), (19263, 1), (19292, 1), (19326, 2), (19377, 1), (19385, 1), (19407, 2), (19448, 2), (19579, 1), (19610, 1), (19644, 1), (19701, 3), (19723, 1), (19756, 3), (19799, 2), (19811, 1), (19829, 1), (20003, 1), (20005, 1), (20031, 1), (20068, 2), (20131, 2), (20223, 1), (20316, 1), (20381, 1), (20494, 2), (20501, 1), (20513, 1), (20573, 2), (20582, 1), (20666, 1), (20686, 2), (20862, 1), (20865, 1), (20901, 4), (20918, 1), (21040, 5), (21074, 3), (21142, 1), (21409, 3), (21451, 1), (21476, 1), (21494, 1), (21518, 2), (21529, 2), (21535, 1), (21554, 1), (21656, 1), (21687, 1), (21690, 1), (21723, 1), (21727, 2), (21734, 1), (21765, 6), (21807, 1), (21874, 3), (21909, 1), (21926, 1), (21935, 2), (21991, 1), (22025, 1), (22030, 1), (22048, 1), (22080, 1), (22082, 1), (22144, 1), (22145, 5), (22181, 1), (22349, 2), (22435, 1), (22506, 2), (22555, 1), (22575, 1), (22633, 2), (22635, 2), (22674, 1), (22679, 1), (22709, 1), (22712, 1), (22738, 1), (22784, 2), (22875, 1), (22923, 1), (22926, 2), (22949, 1), (23060, 1), (23100, 2), (23114, 1), (23189, 1), (23232, 1), (23258, 1), (23275, 4), (23355, 5), (23442, 2), (23443, 1), (23459, 1), (23491, 2), (23519, 2), (23540, 2), (23643, 1), (23653, 1), (23684, 1), (23686, 4), (23713, 1), (23723, 1), (23747, 1), (23804, 2), (23805, 2), (23981, 1), (24051, 1), (24103, 2), (24140, 1), (24154, 1), (24190, 1), (24217, 1), (24226, 1), (24244, 1), (24263, 1), (24277, 1), (24288, 1), (24344, 1), (24379, 1), (24411, 1), (24708, 1), (24722, 1), (24739, 1), (24835, 2), (24938, 1), (24971, 1), (25029, 1), (25030, 1), (25034, 1), (25036, 3), (25063, 1), (25087, 14), (25097, 2), (25111, 1), (25142, 1), (25181, 2), (25189, 3), (25285, 1), (25402, 1), (25412, 1), (25429, 3), (25431, 3), (25473, 10), (25551, 3), (25629, 2), (25630, 2), (25647, 1), (25665, 1), (25713, 1), (25733, 1), (25736, 2), (25749, 6), (25774, 1), (25788, 1), (25999, 1), (26018, 2), (26097, 1), (26163, 1), (26165, 1), (26252, 1), (26262, 1), (26287, 2), (26296, 2), (26345, 1), (26366, 1), (26372, 1), (26435, 1), (26552, 1), (26572, 1), (26580, 4), (26594, 2), (26626, 2)]
+
+
+
+
+
+In [14]: 
+
+
+
+# what is the most common word in that first article?
+most_index, most_count = max(vector, key=lambda (word_index, count): count)
+print(id2word_wiki[most_index], most_count)
+
+
+
+
+
+
+(u'april', 215)
+
+
+
+
+
+
+
+
+Let's store all those bag-of-words vectors into a file, so we don't have to parse the bzipped Wikipedia XML every time over and over:
+
+
+
+In [15]: 
+
+
+
+%time gensim.corpora.MmCorpus.serialize('./data/wiki_bow.mm', wiki_corpus)
+
+
+
+
+
+
+INFO:gensim.corpora.mmcorpus:storing corpus in Matrix Market format to ./data/wiki_bow.mm
+INFO:gensim.matutils:saving sparse matrix to ./data/wiki_bow.mm
+INFO:gensim.matutils:PROGRESS: saving document #0
+INFO:gensim.matutils:PROGRESS: saving document #1000
+INFO:gensim.matutils:PROGRESS: saving document #2000
+INFO:gensim.matutils:PROGRESS: saving document #3000
+INFO:gensim.matutils:PROGRESS: saving document #4000
+INFO:gensim.matutils:PROGRESS: saving document #5000
+INFO:gensim.matutils:PROGRESS: saving document #6000
+INFO:gensim.matutils:PROGRESS: saving document #7000
+INFO:gensim.matutils:PROGRESS: saving document #8000
+INFO:gensim.matutils:PROGRESS: saving document #9000
+INFO:gensim.matutils:PROGRESS: saving document #10000
+INFO:gensim.matutils:PROGRESS: saving document #11000
+INFO:gensim.matutils:PROGRESS: saving document #12000
+INFO:gensim.matutils:PROGRESS: saving document #13000
+INFO:gensim.matutils:PROGRESS: saving document #14000
+INFO:gensim.matutils:PROGRESS: saving document #15000
+INFO:gensim.matutils:PROGRESS: saving document #16000
+INFO:gensim.matutils:PROGRESS: saving document #17000
+INFO:gensim.matutils:PROGRESS: saving document #18000
+INFO:gensim.matutils:PROGRESS: saving document #19000
+INFO:gensim.matutils:PROGRESS: saving document #20000
+INFO:gensim.matutils:PROGRESS: saving document #21000
+INFO:gensim.matutils:PROGRESS: saving document #22000
+INFO:gensim.matutils:PROGRESS: saving document #23000
+INFO:gensim.matutils:PROGRESS: saving document #24000
+INFO:gensim.matutils:PROGRESS: saving document #25000
+INFO:gensim.matutils:PROGRESS: saving document #26000
+INFO:gensim.matutils:PROGRESS: saving document #27000
+INFO:gensim.matutils:PROGRESS: saving document #28000
+INFO:gensim.matutils:PROGRESS: saving document #29000
+INFO:gensim.matutils:PROGRESS: saving document #30000
+INFO:gensim.matutils:PROGRESS: saving document #31000
+INFO:gensim.matutils:PROGRESS: saving document #32000
+INFO:gensim.matutils:PROGRESS: saving document #33000
+INFO:gensim.matutils:PROGRESS: saving document #34000
+INFO:gensim.matutils:PROGRESS: saving document #35000
+INFO:gensim.matutils:PROGRESS: saving document #36000
+INFO:gensim.matutils:PROGRESS: saving document #37000
+INFO:gensim.matutils:PROGRESS: saving document #38000
+INFO:gensim.matutils:PROGRESS: saving document #39000
+INFO:gensim.matutils:PROGRESS: saving document #40000
+INFO:gensim.matutils:PROGRESS: saving document #41000
+INFO:gensim.matutils:PROGRESS: saving document #42000
+INFO:gensim.matutils:PROGRESS: saving document #43000
+INFO:gensim.matutils:PROGRESS: saving document #44000
+INFO:gensim.matutils:PROGRESS: saving document #45000
+INFO:gensim.matutils:PROGRESS: saving document #46000
+INFO:gensim.matutils:PROGRESS: saving document #47000
+INFO:gensim.matutils:PROGRESS: saving document #48000
+INFO:gensim.matutils:saved 48356x26645 matrix, density=0.368% (4743136/1288445620)
+INFO:gensim.corpora.indexedcorpus:saving MmCorpus index to ./data/wiki_bow.mm.index
+
+
+
+
+
+CPU times: user 5min, sys: 1.05 s, total: 5min 1s
+Wall time: 5min 1s
+
+
+
+
+
+In [16]: 
+
+
+
+mm_corpus = gensim.corpora.MmCorpus('./data/wiki_bow.mm')
+print(mm_corpus)
+
+
+
+
+
+
+INFO:gensim.corpora.indexedcorpus:loaded corpus index from ./data/wiki_bow.mm.index
+INFO:gensim.matutils:initializing corpus reader from ./data/wiki_bow.mm
+INFO:gensim.matutils:accepted corpus with 48356 documents, 26645 features, 4743136 non-zero entries
+
+
+
+
+
+MmCorpus(48356 documents, 26645 features, 4743136 non-zero entries)
+
+
+
+
+
+
+
+
+mm_corpus now contains exactly the same bag-of-words vectors as wiki_corpus before, but they are backed by the .mm file, rather than extracted on the fly from the xml.bz2 file:
+
+
+
+In [17]: 
+
+
+
+print(next(iter(mm_corpus)))
+
+
+
+
+
+
+[(24, 1.0), (38, 1.0), (53, 1.0), (103, 1.0), (111, 1.0), (213, 3.0), (237, 1.0), (242, 2.0), (417, 1.0), (455, 3.0), (459, 1.0), (463, 1.0), (505, 1.0), (533, 1.0), (547, 3.0), (718, 1.0), (786, 1.0), (834, 1.0), (858, 2.0), (881, 1.0), (934, 2.0), (944, 1.0), (1191, 3.0), (1205, 1.0), (1233, 1.0), (1366, 1.0), (1426, 1.0), (1469, 2.0), (1477, 2.0), (1495, 2.0), (1540, 1.0), (1611, 1.0), (1732, 1.0), (1749, 1.0), (1823, 1.0), (1913, 3.0), (1953, 1.0), (2003, 1.0), (2042, 1.0), (2142, 1.0), (2143, 1.0), (2324, 1.0), (2336, 5.0), (2382, 9.0), (2390, 1.0), (2537, 1.0), (2576, 2.0), (2583, 1.0), (2602, 1.0), (2617, 1.0), (2657, 2.0), (2684, 1.0), (2721, 1.0), (2952, 1.0), (2966, 1.0), (3066, 2.0), (3182, 2.0), (3235, 1.0), (3331, 4.0), (3357, 1.0), (3359, 5.0), (3383, 1.0), (3412, 2.0), (3480, 1.0), (3484, 1.0), (3504, 1.0), (3542, 2.0), (3555, 2.0), (3575, 1.0), (3578, 1.0), (3598, 5.0), (3632, 1.0), (3636, 1.0), (3643, 1.0), (3668, 1.0), (3704, 1.0), (3747, 1.0), (3781, 1.0), (3793, 2.0), (3808, 2.0), (3814, 1.0), (3853, 1.0), (3947, 1.0), (3969, 4.0), (4004, 1.0), (4007, 1.0), (4018, 2.0), (4032, 2.0), (4048, 1.0), (4128, 1.0), (4197, 1.0), (4216, 1.0), (4219, 2.0), (4238, 1.0), (4254, 11.0), (4298, 1.0), (4350, 1.0), (4370, 1.0), (4388, 1.0), (4419, 1.0), (4439, 1.0), (4465, 1.0), (4496, 1.0), (4518, 4.0), (4558, 1.0), (4582, 2.0), (4587, 2.0), (4694, 1.0), (4698, 1.0), (4701, 1.0), (4703, 1.0), (4792, 1.0), (4853, 2.0), (4901, 8.0), (4907, 3.0), (5006, 2.0), (5061, 2.0), (5066, 1.0), (5116, 2.0), (5163, 1.0), (5183, 1.0), (5226, 2.0), (5262, 2.0), (5268, 2.0), (5381, 1.0), (5390, 1.0), (5431, 2.0), (5439, 2.0), (5509, 1.0), (5512, 1.0), (5526, 1.0), (5535, 2.0), (5608, 1.0), (5631, 1.0), (5641, 1.0), (5742, 1.0), (5761, 1.0), (5767, 3.0), (5773, 11.0), (5795, 1.0), (5804, 3.0), (5841, 2.0), (5852, 1.0), (5892, 1.0), (5975, 1.0), (6015, 1.0), (6121, 1.0), (6190, 1.0), (6199, 2.0), (6212, 1.0), (6227, 1.0), (6233, 1.0), (6242, 215.0), (6246, 1.0), (6247, 1.0), (6278, 1.0), (6358, 1.0), (6394, 1.0), (6544, 1.0), (6616, 1.0), (6629, 1.0), (6630, 1.0), (6715, 1.0), (6840, 4.0), (6882, 1.0), (6891, 2.0), (6907, 1.0), (6945, 4.0), (7034, 1.0), (7064, 1.0), (7083, 1.0), (7086, 2.0), (7252, 1.0), (7288, 1.0), (7343, 1.0), (7401, 8.0), (7461, 1.0), (7511, 1.0), (7542, 1.0), (7627, 1.0), (7664, 1.0), (7748, 1.0), (7839, 1.0), (7861, 3.0), (7899, 1.0), (8136, 3.0), (8175, 2.0), (8181, 1.0), (8186, 3.0), (8245, 1.0), (8255, 1.0), (8371, 1.0), (8430, 1.0), (8439, 1.0), (8467, 1.0), (8580, 5.0), (8609, 1.0), (8617, 1.0), (8622, 2.0), (8662, 1.0), (8674, 1.0), (8715, 1.0), (8723, 1.0), (8750, 2.0), (8761, 4.0), (8832, 1.0), (8881, 4.0), (8908, 1.0), (8956, 1.0), (8979, 1.0), (8981, 2.0), (9180, 3.0), (9200, 1.0), (9274, 1.0), (9380, 1.0), (9418, 4.0), (9424, 1.0), (9432, 1.0), (9433, 3.0), (9484, 3.0), (9495, 2.0), (9524, 1.0), (9546, 1.0), (9550, 1.0), (9760, 3.0), (9999, 1.0), (10068, 2.0), (10184, 6.0), (10188, 1.0), (10212, 1.0), (10271, 3.0), (10282, 1.0), (10285, 1.0), (10288, 1.0), (10308, 2.0), (10315, 4.0), (10378, 1.0), (10413, 4.0), (10484, 5.0), (10549, 1.0), (10576, 1.0), (10589, 1.0), (10590, 3.0), (10709, 1.0), (10715, 2.0), (10737, 1.0), (10781, 1.0), (10786, 2.0), (10850, 1.0), (10909, 1.0), (10960, 1.0), (10988, 1.0), (11009, 1.0), (11059, 1.0), (11060, 1.0), (11067, 1.0), (11148, 1.0), (11152, 1.0), (11166, 1.0), (11279, 1.0), (11352, 1.0), (11357, 1.0), (11467, 1.0), (11484, 1.0), (11555, 1.0), (11615, 1.0), (11724, 1.0), (11744, 1.0), (11774, 5.0), (11803, 1.0), (11830, 1.0), (11857, 2.0), (11899, 1.0), (11945, 1.0), (11970, 3.0), (12000, 3.0), (12057, 1.0), (12082, 1.0), (12093, 1.0), (12113, 1.0), (12185, 3.0), (12257, 6.0), (12288, 2.0), (12315, 2.0), (12355, 1.0), (12356, 6.0), (12375, 1.0), (12399, 2.0), (12514, 1.0), (12590, 1.0), (12599, 1.0), (12601, 1.0), (12606, 1.0), (12618, 1.0), (12619, 1.0), (12625, 1.0), (12706, 1.0), (12730, 2.0), (12770, 2.0), (12941, 1.0), (13020, 1.0), (13064, 1.0), (13163, 1.0), (13229, 2.0), (13288, 1.0), (13345, 1.0), (13450, 1.0), (13481, 1.0), (13503, 1.0), (13524, 3.0), (13547, 2.0), (13563, 6.0), (13582, 4.0), (13627, 1.0), (13630, 1.0), (13634, 1.0), (13666, 1.0), (13693, 2.0), (13715, 1.0), (13781, 1.0), (13823, 1.0), (13839, 1.0), (13856, 1.0), (13911, 1.0), (14040, 1.0), (14081, 3.0), (14145, 1.0), (14154, 1.0), (14159, 1.0), (14195, 1.0), (14320, 1.0), (14371, 1.0), (14379, 2.0), (14439, 3.0), (14455, 3.0), (14458, 1.0), (14601, 2.0), (14605, 1.0), (14682, 1.0), (14711, 1.0), (14775, 2.0), (14779, 1.0), (14815, 5.0), (14839, 1.0), (14843, 1.0), (14897, 1.0), (14908, 2.0), (14917, 3.0), (15006, 1.0), (15018, 1.0), (15039, 1.0), (15047, 1.0), (15092, 2.0), (15094, 1.0), (15137, 1.0), (15156, 1.0), (15179, 1.0), (15268, 2.0), (15275, 1.0), (15292, 1.0), (15299, 1.0), (15335, 4.0), (15378, 1.0), (15517, 3.0), (15543, 2.0), (15553, 1.0), (15612, 4.0), (15619, 1.0), (15623, 1.0), (15643, 2.0), (15766, 1.0), (15856, 2.0), (15873, 1.0), (15930, 2.0), (15981, 2.0), (16036, 5.0), (16053, 3.0), (16110, 1.0), (16255, 1.0), (16259, 1.0), (16317, 2.0), (16347, 1.0), (16387, 1.0), (16560, 2.0), (16568, 2.0), (16624, 2.0), (16687, 1.0), (16694, 1.0), (16705, 6.0), (16738, 1.0), (16886, 4.0), (16890, 1.0), (16945, 1.0), (16954, 1.0), (16999, 1.0), (17089, 1.0), (17160, 1.0), (17186, 1.0), (17191, 2.0), (17199, 1.0), (17244, 1.0), (17290, 1.0), (17364, 2.0), (17499, 1.0), (17518, 1.0), (17535, 1.0), (17706, 3.0), (17762, 1.0), (17899, 3.0), (17906, 8.0), (17918, 1.0), (17954, 2.0), (17965, 1.0), (17977, 1.0), (17982, 1.0), (18116, 1.0), (18215, 2.0), (18238, 1.0), (18322, 1.0), (18481, 2.0), (18516, 1.0), (18538, 3.0), (18541, 1.0), (18551, 1.0), (18561, 1.0), (18590, 1.0), (18593, 1.0), (18644, 3.0), (18710, 1.0), (18714, 1.0), (18724, 1.0), (18830, 1.0), (18835, 1.0), (18860, 1.0), (18871, 2.0), (18903, 2.0), (18942, 1.0), (18995, 1.0), (19000, 1.0), (19045, 1.0), (19053, 4.0), (19061, 1.0), (19097, 1.0), (19144, 1.0), (19164, 1.0), (19246, 1.0), (19256, 1.0), (19263, 1.0), (19292, 1.0), (19326, 2.0), (19377, 1.0), (19385, 1.0), (19407, 2.0), (19448, 2.0), (19579, 1.0), (19610, 1.0), (19644, 1.0), (19701, 3.0), (19723, 1.0), (19756, 3.0), (19799, 2.0), (19811, 1.0), (19829, 1.0), (20003, 1.0), (20005, 1.0), (20031, 1.0), (20068, 2.0), (20131, 2.0), (20223, 1.0), (20316, 1.0), (20381, 1.0), (20494, 2.0), (20501, 1.0), (20513, 1.0), (20573, 2.0), (20582, 1.0), (20666, 1.0), (20686, 2.0), (20862, 1.0), (20865, 1.0), (20901, 4.0), (20918, 1.0), (21040, 5.0), (21074, 3.0), (21142, 1.0), (21409, 3.0), (21451, 1.0), (21476, 1.0), (21494, 1.0), (21518, 2.0), (21529, 2.0), (21535, 1.0), (21554, 1.0), (21656, 1.0), (21687, 1.0), (21690, 1.0), (21723, 1.0), (21727, 2.0), (21734, 1.0), (21765, 6.0), (21807, 1.0), (21874, 3.0), (21909, 1.0), (21926, 1.0), (21935, 2.0), (21991, 1.0), (22025, 1.0), (22030, 1.0), (22048, 1.0), (22080, 1.0), (22082, 1.0), (22144, 1.0), (22145, 5.0), (22181, 1.0), (22349, 2.0), (22435, 1.0), (22506, 2.0), (22555, 1.0), (22575, 1.0), (22633, 2.0), (22635, 2.0), (22674, 1.0), (22679, 1.0), (22709, 1.0), (22712, 1.0), (22738, 1.0), (22784, 2.0), (22875, 1.0), (22923, 1.0), (22926, 2.0), (22949, 1.0), (23060, 1.0), (23100, 2.0), (23114, 1.0), (23189, 1.0), (23232, 1.0), (23258, 1.0), (23275, 4.0), (23355, 5.0), (23442, 2.0), (23443, 1.0), (23459, 1.0), (23491, 2.0), (23519, 2.0), (23540, 2.0), (23643, 1.0), (23653, 1.0), (23684, 1.0), (23686, 4.0), (23713, 1.0), (23723, 1.0), (23747, 1.0), (23804, 2.0), (23805, 2.0), (23981, 1.0), (24051, 1.0), (24103, 2.0), (24140, 1.0), (24154, 1.0), (24190, 1.0), (24217, 1.0), (24226, 1.0), (24244, 1.0), (24263, 1.0), (24277, 1.0), (24288, 1.0), (24344, 1.0), (24379, 1.0), (24411, 1.0), (24708, 1.0), (24722, 1.0), (24739, 1.0), (24835, 2.0), (24938, 1.0), (24971, 1.0), (25029, 1.0), (25030, 1.0), (25034, 1.0), (25036, 3.0), (25063, 1.0), (25087, 14.0), (25097, 2.0), (25111, 1.0), (25142, 1.0), (25181, 2.0), (25189, 3.0), (25285, 1.0), (25402, 1.0), (25412, 1.0), (25429, 3.0), (25431, 3.0), (25473, 10.0), (25551, 3.0), (25629, 2.0), (25630, 2.0), (25647, 1.0), (25665, 1.0), (25713, 1.0), (25733, 1.0), (25736, 2.0), (25749, 6.0), (25774, 1.0), (25788, 1.0), (25999, 1.0), (26018, 2.0), (26097, 1.0), (26163, 1.0), (26165, 1.0), (26252, 1.0), (26262, 1.0), (26287, 2.0), (26296, 2.0), (26345, 1.0), (26366, 1.0), (26372, 1.0), (26435, 1.0), (26552, 1.0), (26572, 1.0), (26580, 4.0), (26594, 2.0), (26626, 2.0)]
+
+
+
+
+
+
+
+
+Semantic transformations
+
+
+
+
+
+
+Topic modeling in gensim is realized via transformations. A transformation is something that takes a corpus and spits out another corpus on output, using corpus_out = transformation_object[corpus_in] syntax. What exactly happens in between is determined by what kind of transformation we're using -- options are Latent Semantic Indexing (LSI), Latent Dirichlet Allocation (LDA), Random Projections (RP) etc.
+
+Some transformations need to be initialized (=trained) before they can be used. For example, let's train an LDA transformation model, using our bag-of-words WikiCorpus as training data:
+
+
+
+In [18]: 
+
+
+
+clipped_corpus = gensim.utils.ClippedCorpus(mm_corpus, 4000)  # use fewer documents during training, LDA is slow
+# ClippedCorpus new in gensim 0.10.1
+# copy&paste it from https://github.com/piskvorky/gensim/blob/0.10.1/gensim/utils.py#L467 if necessary (or upgrade your gensim)
+%time lda_model = gensim.models.LdaModel(clipped_corpus, num_topics=10, id2word=id2word_wiki, passes=4)
+
+
+
+
+
+
+INFO:gensim.models.ldamodel:using symmetric alpha at 0.1
+INFO:gensim.models.ldamodel:using serial LDA version on this node
+INFO:gensim.models.ldamodel:running online LDA training, 10 topics, 4 passes over the supplied corpus of 4000 documents, updating model once every 2000 documents, evaluating perplexity every 4000 documents, iterating 50x with a convergence threshold of 0.001000
+WARNING:gensim.models.ldamodel:too few updates, training might not converge; consider increasing the number of passes or iterations to improve accuracy
+INFO:gensim.models.ldamodel:PROGRESS: pass 0, at document #2000/4000
+INFO:gensim.models.ldamodel:merging changes from 2000 documents into a model of 4000 documents
+INFO:gensim.models.ldamodel:topic #0 (0.100): 0.004*president + 0.003*british + 0.002*king + 0.002*person + 0.002*water + 0.002*things + 0.002*february + 0.002*french + 0.002*actor + 0.002*example
+INFO:gensim.models.ldamodel:topic #1 (0.100): 0.008*hex + 0.006*rgb + 0.003*bc + 0.003*country + 0.002*light + 0.002*king + 0.002*water + 0.002*color + 0.002*actor + 0.002*person
+INFO:gensim.models.ldamodel:topic #2 (0.100): 0.003*party + 0.003*mast + 0.003*tower + 0.003*transmission + 0.003*earth + 0.002*april + 0.002*things + 0.002*god + 0.002*president + 0.002*french
+INFO:gensim.models.ldamodel:topic #3 (0.100): 0.003*april + 0.002*league + 0.002*october + 0.002*language + 0.002*december + 0.002*rgb + 0.002*example + 0.002*german + 0.002*person + 0.002*football
+INFO:gensim.models.ldamodel:topic #4 (0.100): 0.005*lake + 0.003*king + 0.003*actress + 0.003*country + 0.003*british + 0.003*german + 0.002*president + 0.002*player + 0.002*countries + 0.002*queen
+INFO:gensim.models.ldamodel:topic #5 (0.100): 0.007*bridge + 0.003*rgb + 0.002*tower + 0.002*hex + 0.002*transmission + 0.002*president + 0.002*church + 0.002*mario + 0.002*british + 0.002*king
+INFO:gensim.models.ldamodel:topic #6 (0.100): 0.004*countries + 0.003*british + 0.003*country + 0.003*president + 0.003*december + 0.002*actress + 0.002*tower + 0.002*singer + 0.002*french + 0.002*actor
+INFO:gensim.models.ldamodel:topic #7 (0.100): 0.003*word + 0.003*language + 0.003*river + 0.002*country + 0.002*ii + 0.002*example + 0.002*things + 0.002*france + 0.002*september + 0.002*union
+INFO:gensim.models.ldamodel:topic #8 (0.100): 0.003*august + 0.003*country + 0.003*july + 0.003*music + 0.002*british + 0.002*water + 0.002*december + 0.002*person + 0.002*countries + 0.002*china
+INFO:gensim.models.ldamodel:topic #9 (0.100): 0.003*president + 0.003*german + 0.003*actor + 0.002*king + 0.002*germany + 0.002*countries + 0.002*december + 0.002*october + 0.002*france + 0.002*example
+INFO:gensim.models.ldamodel:topic diff=3.341654, rho=1.000000
+INFO:gensim.models.ldamodel:-9.406 per-word bound, 678.2 perplexity estimate based on a held-out corpus of 2000 documents with 648272 words
+INFO:gensim.models.ldamodel:PROGRESS: pass 0, at document #4000/4000
+INFO:gensim.models.ldamodel:merging changes from 2000 documents into a model of 4000 documents
+INFO:gensim.models.ldamodel:topic #0 (0.100): 0.005*president + 0.005*british + 0.004*french + 0.004*actor + 0.004*singer + 0.004*writer + 0.004*italian + 0.003*player + 0.003*german + 0.003*politician
+INFO:gensim.models.ldamodel:topic #1 (0.100): 0.014*hex + 0.013*rgb + 0.007*color + 0.004*blood + 0.004*pink + 0.003*red + 0.003*body + 0.003*disease + 0.003*bc + 0.003*light
+INFO:gensim.models.ldamodel:topic #2 (0.100): 0.004*god + 0.004*party + 0.003*band + 0.002*music + 0.002*rock + 0.002*school + 0.002*president + 0.002*things + 0.002*earth + 0.002*book
+INFO:gensim.models.ldamodel:topic #3 (0.100): 0.005*game + 0.003*league + 0.003*player + 0.002*football + 0.002*album + 0.002*africa + 0.002*example + 0.002*means + 0.002*person + 0.002*language
+INFO:gensim.models.ldamodel:topic #4 (0.100): 0.009*german + 0.009*actress + 0.009*writer + 0.009*actor + 0.008*british + 0.008*player + 0.007*singer + 0.007*footballer + 0.007*french + 0.006*politician
+INFO:gensim.models.ldamodel:topic #5 (0.100): 0.004*bridge + 0.003*jpg + 0.002*cells + 0.002*plants + 0.002*live + 0.002*image + 0.002*species + 0.002*animals + 0.002*water + 0.002*blood
+INFO:gensim.models.ldamodel:topic #6 (0.100): 0.008*singer + 0.007*british + 0.007*french + 0.006*actor + 0.006*actress + 0.006*president + 0.005*footballer + 0.005*politician + 0.005*italian + 0.004*writer
+INFO:gensim.models.ldamodel:topic #7 (0.100): 0.003*river + 0.003*language + 0.003*word + 0.002*country + 0.002*means + 0.002*example + 0.002*things + 0.002*pope + 0.002*person + 0.002*church
+INFO:gensim.models.ldamodel:topic #8 (0.100): 0.005*music + 0.003*country + 0.003*person + 0.002*things + 0.002*countries + 0.002*water + 0.002*fish + 0.002*government + 0.002*china + 0.002*august
+INFO:gensim.models.ldamodel:topic #9 (0.100): 0.008*actor + 0.008*german + 0.006*politician + 0.005*footballer + 0.005*president + 0.005*british + 0.005*french + 0.005*writer + 0.004*singer + 0.004*actress
+INFO:gensim.models.ldamodel:topic diff=1.555354, rho=0.707107
+INFO:gensim.models.ldamodel:PROGRESS: pass 1, at document #2000/4000
+INFO:gensim.models.ldamodel:merging changes from 2000 documents into a model of 4000 documents
+INFO:gensim.models.ldamodel:topic #0 (0.100): 0.005*president + 0.004*british + 0.003*french + 0.003*island + 0.003*actor + 0.003*king + 0.003*york + 0.003*italian + 0.003*singer + 0.002*february
+INFO:gensim.models.ldamodel:topic #1 (0.100): 0.019*hex + 0.018*rgb + 0.009*color + 0.006*bc + 0.005*light + 0.005*blue + 0.004*body + 0.004*blood + 0.004*red + 0.004*web
+INFO:gensim.models.ldamodel:topic #2 (0.100): 0.007*tower + 0.006*mast + 0.006*transmission + 0.005*god + 0.003*party + 0.003*earth + 0.003*left + 0.002*mount + 0.002*books + 0.002*things
+INFO:gensim.models.ldamodel:topic #3 (0.100): 0.004*league + 0.004*energy + 0.004*light + 0.003*game + 0.003*example + 0.003*earth + 0.003*football + 0.003*mass + 0.003*space + 0.002*team
+INFO:gensim.models.ldamodel:topic #4 (0.100): 0.009*actor + 0.008*actress + 0.008*german + 0.008*british + 0.008*writer + 0.008*singer + 0.007*french + 0.007*player + 0.007*footballer + 0.006*politician
+INFO:gensim.models.ldamodel:topic #5 (0.100): 0.007*bridge + 0.004*water + 0.004*jpg + 0.004*mario + 0.004*image + 0.003*plants + 0.003*animals + 0.003*birds + 0.003*cells + 0.003*food
+INFO:gensim.models.ldamodel:topic #6 (0.100): 0.007*president + 0.006*singer + 0.006*british + 0.005*french + 0.005*actor + 0.004*actress + 0.004*footballer + 0.003*politician + 0.003*italian + 0.003*writer
+INFO:gensim.models.ldamodel:topic #7 (0.100): 0.006*language + 0.005*word + 0.004*river + 0.003*internet + 0.003*example + 0.003*country + 0.003*words + 0.003*languages + 0.003*things + 0.003*windows
+INFO:gensim.models.ldamodel:topic #8 (0.100): 0.006*music + 0.004*countries + 0.004*country + 0.004*person + 0.004*government + 0.003*china + 0.003*things + 0.003*water + 0.002*money + 0.002*example
+INFO:gensim.models.ldamodel:topic #9 (0.100): 0.007*actor + 0.007*german + 0.005*president + 0.004*politician + 0.004*british + 0.004*footballer + 0.004*french + 0.004*january + 0.004*november + 0.004*december
+INFO:gensim.models.ldamodel:topic diff=1.031001, rho=0.577350
+INFO:gensim.models.ldamodel:-8.682 per-word bound, 410.6 perplexity estimate based on a held-out corpus of 2000 documents with 648272 words
+INFO:gensim.models.ldamodel:PROGRESS: pass 1, at document #4000/4000
+INFO:gensim.models.ldamodel:merging changes from 2000 documents into a model of 4000 documents
+INFO:gensim.models.ldamodel:topic #0 (0.100): 0.006*album + 0.005*president + 0.004*released + 0.003*british + 0.003*island + 0.003*band + 0.003*york + 0.002*french + 0.002*movie + 0.002*king
+INFO:gensim.models.ldamodel:topic #1 (0.100): 0.018*hex + 0.018*rgb + 0.010*color + 0.008*blood + 0.006*body + 0.006*disease + 0.005*red + 0.005*blue + 0.005*bc + 0.005*light
+INFO:gensim.models.ldamodel:topic #2 (0.100): 0.005*god + 0.005*tower + 0.004*mast + 0.004*transmission + 0.003*party + 0.003*left + 0.003*band + 0.003*book + 0.003*earth + 0.003*school
+INFO:gensim.models.ldamodel:topic #3 (0.100): 0.005*game + 0.004*league + 0.004*light + 0.003*example + 0.003*energy + 0.003*team + 0.003*player + 0.003*football + 0.003*earth + 0.003*games
+INFO:gensim.models.ldamodel:topic #4 (0.100): 0.011*actor + 0.010*german + 0.010*british + 0.009*actress + 0.009*singer + 0.009*writer + 0.009*french + 0.009*footballer + 0.008*politician + 0.008*player
+INFO:gensim.models.ldamodel:topic #5 (0.100): 0.005*jpg + 0.005*bridge + 0.005*water + 0.004*species + 0.004*image + 0.004*live + 0.003*animals + 0.003*plants + 0.003*food + 0.003*cells
+INFO:gensim.models.ldamodel:topic #6 (0.100): 0.009*president + 0.005*british + 0.005*singer + 0.005*french + 0.004*actor + 0.004*actress + 0.003*footballer + 0.003*italian + 0.003*politician + 0.003*german
+INFO:gensim.models.ldamodel:topic #7 (0.100): 0.006*language + 0.004*river + 0.004*word + 0.003*means + 0.003*country + 0.003*example + 0.003*windows + 0.003*languages + 0.003*internet + 0.003*church
+INFO:gensim.models.ldamodel:topic #8 (0.100): 0.007*music + 0.004*person + 0.004*country + 0.004*countries + 0.003*things + 0.003*government + 0.003*money + 0.003*china + 0.002*example + 0.002*water
+INFO:gensim.models.ldamodel:topic #9 (0.100): 0.007*actor + 0.006*german + 0.005*president + 0.004*january + 0.004*november + 0.004*december + 0.004*british + 0.004*singer + 0.004*movie + 0.004*october
+INFO:gensim.models.ldamodel:topic diff=0.768998, rho=0.500000
+INFO:gensim.models.ldamodel:PROGRESS: pass 2, at document #2000/4000
+INFO:gensim.models.ldamodel:merging changes from 2000 documents into a model of 4000 documents
+INFO:gensim.models.ldamodel:topic #0 (0.100): 0.004*album + 0.004*president + 0.004*island + 0.003*british + 0.003*york + 0.003*award + 0.003*released + 0.003*king + 0.002*movie + 0.002*won
+INFO:gensim.models.ldamodel:topic #1 (0.100): 0.021*rgb + 0.021*hex + 0.011*color + 0.007*blood + 0.007*body + 0.006*bc + 0.006*blue + 0.006*light + 0.006*disease + 0.005*green
+INFO:gensim.models.ldamodel:topic #2 (0.100): 0.008*tower + 0.007*mast + 0.006*transmission + 0.006*god + 0.004*left + 0.003*party + 0.003*books + 0.003*earth + 0.003*mount + 0.003*book
+INFO:gensim.models.ldamodel:topic #3 (0.100): 0.005*league + 0.005*light + 0.005*energy + 0.004*earth + 0.004*game + 0.004*example + 0.003*football + 0.003*space + 0.003*mass + 0.003*universe
+INFO:gensim.models.ldamodel:topic #4 (0.100): 0.010*actor + 0.010*british + 0.010*german + 0.009*singer + 0.009*actress + 0.009*french + 0.009*writer + 0.008*footballer + 0.008*politician + 0.007*player
+INFO:gensim.models.ldamodel:topic #5 (0.100): 0.007*water + 0.006*bridge + 0.005*jpg + 0.004*image + 0.004*animals + 0.004*mario + 0.004*plants + 0.004*species + 0.004*food + 0.004*live
+INFO:gensim.models.ldamodel:topic #6 (0.100): 0.009*president + 0.004*british + 0.004*korea + 0.004*july + 0.004*april + 0.004*french + 0.004*singer + 0.003*union + 0.003*government + 0.003*december
+INFO:gensim.models.ldamodel:topic #7 (0.100): 0.008*language + 0.005*word + 0.005*river + 0.004*languages + 0.004*internet + 0.004*words + 0.004*country + 0.004*windows + 0.004*example + 0.003*church
+INFO:gensim.models.ldamodel:topic #8 (0.100): 0.007*music + 0.005*countries + 0.004*person + 0.004*country + 0.004*government + 0.004*things + 0.004*china + 0.003*money + 0.003*good + 0.002*example
+INFO:gensim.models.ldamodel:topic #9 (0.100): 0.006*january + 0.006*actor + 0.006*november + 0.006*december + 0.006*german + 0.006*october + 0.005*february + 0.005*august + 0.005*september + 0.004*april
+INFO:gensim.models.ldamodel:topic diff=0.665062, rho=0.447214
+INFO:gensim.models.ldamodel:-8.534 per-word bound, 370.6 perplexity estimate based on a held-out corpus of 2000 documents with 648272 words
+INFO:gensim.models.ldamodel:PROGRESS: pass 2, at document #4000/4000
+INFO:gensim.models.ldamodel:merging changes from 2000 documents into a model of 4000 documents
+INFO:gensim.models.ldamodel:topic #0 (0.100): 0.008*album + 0.005*band + 0.005*released + 0.004*island + 0.004*president + 0.003*york + 0.003*movie + 0.003*award + 0.003*british + 0.003*music
+INFO:gensim.models.ldamodel:topic #1 (0.100): 0.019*rgb + 0.019*hex + 0.011*color + 0.009*blood + 0.007*body + 0.007*disease + 0.005*red + 0.005*blue + 0.005*person + 0.005*light
+INFO:gensim.models.ldamodel:topic #2 (0.100): 0.007*god + 0.006*tower + 0.005*mast + 0.004*transmission + 0.004*left + 0.003*book + 0.003*party + 0.003*books + 0.003*school + 0.003*believe
+INFO:gensim.models.ldamodel:topic #3 (0.100): 0.005*game + 0.005*league + 0.005*light + 0.004*energy + 0.004*example + 0.004*earth + 0.003*team + 0.003*player + 0.003*football + 0.003*games
+INFO:gensim.models.ldamodel:topic #4 (0.100): 0.011*actor + 0.010*german + 0.010*british + 0.010*singer + 0.010*french + 0.009*actress + 0.009*footballer + 0.009*writer + 0.009*politician + 0.008*player
+INFO:gensim.models.ldamodel:topic #5 (0.100): 0.007*water + 0.006*jpg + 0.005*bridge + 0.005*species + 0.004*image + 0.004*animals + 0.004*live + 0.004*plants + 0.004*food + 0.003*air
+INFO:gensim.models.ldamodel:topic #6 (0.100): 0.011*president + 0.004*british + 0.004*government + 0.004*july + 0.003*korea + 0.003*union + 0.003*country + 0.003*april + 0.003*french + 0.003*december
+INFO:gensim.models.ldamodel:topic #7 (0.100): 0.008*language + 0.005*word + 0.005*river + 0.004*languages + 0.004*means + 0.004*windows + 0.004*country + 0.004*words + 0.003*internet + 0.003*example
+INFO:gensim.models.ldamodel:topic #8 (0.100): 0.008*music + 0.005*person + 0.004*countries + 0.004*country + 0.004*things + 0.004*government + 0.003*money + 0.003*china + 0.003*good + 0.002*example
+INFO:gensim.models.ldamodel:topic #9 (0.100): 0.007*january + 0.006*november + 0.006*actor + 0.006*december + 0.006*february + 0.005*october + 0.005*german + 0.005*august + 0.005*april + 0.005*september
+INFO:gensim.models.ldamodel:topic diff=0.516658, rho=0.408248
+INFO:gensim.models.ldamodel:PROGRESS: pass 3, at document #2000/4000
+INFO:gensim.models.ldamodel:merging changes from 2000 documents into a model of 4000 documents
+INFO:gensim.models.ldamodel:topic #0 (0.100): 0.006*album + 0.004*band + 0.004*released + 0.004*island + 0.004*award + 0.004*york + 0.003*president + 0.003*movie + 0.003*british + 0.003*music
+INFO:gensim.models.ldamodel:topic #1 (0.100): 0.022*rgb + 0.022*hex + 0.012*color + 0.008*blood + 0.008*body + 0.006*disease + 0.006*blue + 0.006*bc + 0.006*green + 0.006*light
+INFO:gensim.models.ldamodel:topic #2 (0.100): 0.008*tower + 0.007*god + 0.007*mast + 0.007*transmission + 0.004*left + 0.003*books + 0.003*book + 0.003*mount + 0.003*believe + 0.003*party
+INFO:gensim.models.ldamodel:topic #3 (0.100): 0.005*light + 0.005*earth + 0.005*league + 0.005*energy + 0.004*example + 0.004*game + 0.003*space + 0.003*universe + 0.003*football + 0.003*team
+INFO:gensim.models.ldamodel:topic #4 (0.100): 0.011*actor + 0.010*british + 0.010*german + 0.009*singer + 0.009*french + 0.009*actress + 0.009*footballer + 0.009*writer + 0.008*politician + 0.008*player
+INFO:gensim.models.ldamodel:topic #5 (0.100): 0.008*water + 0.006*bridge + 0.006*jpg + 0.005*animals + 0.004*image + 0.004*species + 0.004*food + 0.004*plants + 0.004*live + 0.004*mario
+INFO:gensim.models.ldamodel:topic #6 (0.100): 0.011*president + 0.005*government + 0.005*union + 0.004*korea + 0.004*july + 0.004*april + 0.004*country + 0.004*countries + 0.003*december + 0.003*usa
+INFO:gensim.models.ldamodel:topic #7 (0.100): 0.009*language + 0.006*word + 0.005*languages + 0.005*river + 0.005*words + 0.004*internet + 0.004*windows + 0.004*country + 0.004*example + 0.004*lake
+INFO:gensim.models.ldamodel:topic #8 (0.100): 0.008*music + 0.005*person + 0.005*countries + 0.004*government + 0.004*country + 0.004*things + 0.004*china + 0.004*money + 0.003*good + 0.003*example
+INFO:gensim.models.ldamodel:topic #9 (0.100): 0.009*january + 0.008*december + 0.007*november + 0.007*february + 0.007*october + 0.006*september + 0.006*august + 0.006*april + 0.006*actor + 0.005*german
+INFO:gensim.models.ldamodel:topic diff=0.465383, rho=0.377964
+INFO:gensim.models.ldamodel:-8.469 per-word bound, 354.5 perplexity estimate based on a held-out corpus of 2000 documents with 648272 words
+INFO:gensim.models.ldamodel:PROGRESS: pass 3, at document #4000/4000
+INFO:gensim.models.ldamodel:merging changes from 2000 documents into a model of 4000 documents
+INFO:gensim.models.ldamodel:topic #0 (0.100): 0.009*album + 0.007*band + 0.005*released + 0.004*movie + 0.004*music + 0.003*island + 0.003*york + 0.003*award + 0.003*series + 0.003*song
+INFO:gensim.models.ldamodel:topic #1 (0.100): 0.020*rgb + 0.020*hex + 0.011*color + 0.010*blood + 0.008*body + 0.007*disease + 0.006*person + 0.006*blue + 0.006*red + 0.005*green
+INFO:gensim.models.ldamodel:topic #2 (0.100): 0.007*god + 0.007*tower + 0.005*mast + 0.005*transmission + 0.004*left + 0.004*book + 0.003*books + 0.003*believe + 0.003*school + 0.003*mount
+INFO:gensim.models.ldamodel:topic #3 (0.100): 0.005*light + 0.005*game + 0.005*league + 0.005*earth + 0.004*energy + 0.004*example + 0.003*player + 0.003*team + 0.003*games + 0.003*football
+INFO:gensim.models.ldamodel:topic #4 (0.100): 0.011*actor + 0.011*german + 0.010*british + 0.010*singer + 0.010*french + 0.009*footballer + 0.009*actress + 0.009*writer + 0.009*politician + 0.008*player
+INFO:gensim.models.ldamodel:topic #5 (0.100): 0.008*water + 0.006*jpg + 0.005*bridge + 0.005*species + 0.004*image + 0.004*animals + 0.004*live + 0.004*food + 0.004*plants + 0.003*air
+INFO:gensim.models.ldamodel:topic #6 (0.100): 0.012*president + 0.005*government + 0.004*country + 0.004*union + 0.004*july + 0.004*party + 0.004*korea + 0.004*april + 0.003*army + 0.003*countries
+INFO:gensim.models.ldamodel:topic #7 (0.100): 0.009*language + 0.005*word + 0.005*languages + 0.005*river + 0.004*windows + 0.004*words + 0.004*means + 0.004*country + 0.004*internet + 0.004*example
+INFO:gensim.models.ldamodel:topic #8 (0.100): 0.008*music + 0.005*person + 0.005*countries + 0.004*things + 0.004*country + 0.004*government + 0.004*money + 0.003*china + 0.003*good + 0.003*example
+INFO:gensim.models.ldamodel:topic #9 (0.100): 0.009*january + 0.007*november + 0.007*december + 0.007*february + 0.007*october + 0.006*august + 0.006*april + 0.006*september + 0.006*actor + 0.005*movie
+INFO:gensim.models.ldamodel:topic diff=0.367905, rho=0.353553
+
+
+
+
+
+CPU times: user 2min 49s, sys: 146 ms, total: 2min 49s
+Wall time: 2min 49s
+
+
+
+
+
+In [19]: 
+
+
+
+_ = lda_model.print_topics(-1)  # print a few most important words for each LDA topic
+
+
+
+
+
+
+INFO:gensim.models.ldamodel:topic #0 (0.100): 0.009*album + 0.007*band + 0.005*released + 0.004*movie + 0.004*music + 0.003*island + 0.003*york + 0.003*award + 0.003*series + 0.003*song
+INFO:gensim.models.ldamodel:topic #1 (0.100): 0.020*rgb + 0.020*hex + 0.011*color + 0.010*blood + 0.008*body + 0.007*disease + 0.006*person + 0.006*blue + 0.006*red + 0.005*green
+INFO:gensim.models.ldamodel:topic #2 (0.100): 0.007*god + 0.007*tower + 0.005*mast + 0.005*transmission + 0.004*left + 0.004*book + 0.003*books + 0.003*believe + 0.003*school + 0.003*mount
+INFO:gensim.models.ldamodel:topic #3 (0.100): 0.005*light + 0.005*game + 0.005*league + 0.005*earth + 0.004*energy + 0.004*example + 0.003*player + 0.003*team + 0.003*games + 0.003*football
+INFO:gensim.models.ldamodel:topic #4 (0.100): 0.011*actor + 0.011*german + 0.010*british + 0.010*singer + 0.010*french + 0.009*footballer + 0.009*actress + 0.009*writer + 0.009*politician + 0.008*player
+INFO:gensim.models.ldamodel:topic #5 (0.100): 0.008*water + 0.006*jpg + 0.005*bridge + 0.005*species + 0.004*image + 0.004*animals + 0.004*live + 0.004*food + 0.004*plants + 0.003*air
+INFO:gensim.models.ldamodel:topic #6 (0.100): 0.012*president + 0.005*government + 0.004*country + 0.004*union + 0.004*july + 0.004*party + 0.004*korea + 0.004*april + 0.003*army + 0.003*countries
+INFO:gensim.models.ldamodel:topic #7 (0.100): 0.009*language + 0.005*word + 0.005*languages + 0.005*river + 0.004*windows + 0.004*words + 0.004*means + 0.004*country + 0.004*internet + 0.004*example
+INFO:gensim.models.ldamodel:topic #8 (0.100): 0.008*music + 0.005*person + 0.005*countries + 0.004*things + 0.004*country + 0.004*government + 0.004*money + 0.003*china + 0.003*good + 0.003*example
+INFO:gensim.models.ldamodel:topic #9 (0.100): 0.009*january + 0.007*november + 0.007*december + 0.007*february + 0.007*october + 0.006*august + 0.006*april + 0.006*september + 0.006*actor + 0.005*movie
+
+
+
+
+
+
+
+
+More info on model parameters in gensim docs.
+
+
+
+
+
+
+Transformation can be stacked. For example, here we'll train a TFIDF model, and then train Latent Semantic Analysis on top of TFIDF:
+
+
+
+In [20]: 
+
+
+
+%time tfidf_model = gensim.models.TfidfModel(mm_corpus, id2word=id2word_wiki)
+
+
+
+
+
+
+INFO:gensim.models.tfidfmodel:collecting document frequencies
+INFO:gensim.models.tfidfmodel:PROGRESS: processing document #0
+INFO:gensim.models.tfidfmodel:PROGRESS: processing document #10000
+INFO:gensim.models.tfidfmodel:PROGRESS: processing document #20000
+INFO:gensim.models.tfidfmodel:PROGRESS: processing document #30000
+INFO:gensim.models.tfidfmodel:PROGRESS: processing document #40000
+INFO:gensim.models.tfidfmodel:calculating IDF weights for 48356 documents and 26644 features (4743136 matrix non-zeros)
+
+
+
+
+
+CPU times: user 34.8 s, sys: 59.1 ms, total: 34.9 s
+Wall time: 34.9 s
+
+
+
+
+
+
+
+
+The TFIDF transformation only modifies feature weights of each word. Its input and output dimensionality are identical (=the dictionary size).
+
+
+
+In [21]: 
+
+
+
+%time lsi_model = gensim.models.LsiModel(tfidf_model[mm_corpus], id2word=id2word_wiki, num_topics=200)
+
+
+
+
+
+
+INFO:gensim.models.lsimodel:using serial LSI version on this node
+INFO:gensim.models.lsimodel:updating model with new documents
+INFO:gensim.models.lsimodel:preparing a new chunk of documents
+INFO:gensim.models.lsimodel:using 100 extra samples and 2 power iterations
+INFO:gensim.models.lsimodel:1st phase: constructing (26645, 300) action matrix
+INFO:gensim.models.lsimodel:orthonormalizing (26645, 300) action matrix
+INFO:gensim.models.lsimodel:2nd phase: running dense svd on (300, 20000) matrix
+INFO:gensim.models.lsimodel:computing the final decomposition
+INFO:gensim.models.lsimodel:keeping 200 factors (discarding 15.252% of energy spectrum)
+INFO:gensim.models.lsimodel:processed documents up to #20000
+INFO:gensim.models.lsimodel:topic #0(15.142): -0.195*"footballer" + -0.181*"actor" + -0.172*"german" + -0.163*"actress" + -0.157*"writer" + -0.156*"politician" + -0.155*"singer" + -0.154*"french" + -0.146*"british" + -0.133*"president"
+INFO:gensim.models.lsimodel:topic #1(10.338): -0.206*"footballer" + 0.163*"music" + -0.161*"actor" + -0.156*"politician" + -0.148*"actress" + -0.136*"writer" + -0.118*"singer" + 0.110*"band" + 0.108*"album" + 0.105*"district"
+INFO:gensim.models.lsimodel:topic #2(8.766): 0.376*"district" + -0.248*"music" + 0.226*"coat" + 0.214*"arms" + -0.209*"band" + -0.207*"album" + 0.172*"municipalities" + 0.165*"county" + 0.160*"river" + 0.136*"towns"
+INFO:gensim.models.lsimodel:topic #3(7.973): 0.387*"district" + 0.269*"coat" + 0.253*"arms" + 0.233*"band" + 0.226*"album" + 0.205*"music" + 0.184*"municipalities" + 0.126*"towns" + 0.119*"districts" + 0.114*"guitar"
+INFO:gensim.models.lsimodel:topic #4(7.494): 0.325*"league" + 0.197*"team" + -0.183*"music" + -0.169*"king" + 0.162*"football" + 0.156*"division" + 0.139*"nhl" + 0.138*"game" + 0.135*"cup" + 0.135*"season"
+INFO:gensim.models.lsimodel:preparing a new chunk of documents
+INFO:gensim.models.lsimodel:using 100 extra samples and 2 power iterations
+INFO:gensim.models.lsimodel:1st phase: constructing (26645, 300) action matrix
+INFO:gensim.models.lsimodel:orthonormalizing (26645, 300) action matrix
+INFO:gensim.models.lsimodel:2nd phase: running dense svd on (300, 20000) matrix
+INFO:gensim.models.lsimodel:computing the final decomposition
+INFO:gensim.models.lsimodel:keeping 200 factors (discarding 13.796% of energy spectrum)
+INFO:gensim.models.lsimodel:merging projections: (26645, 200) + (26645, 200)
+INFO:gensim.models.lsimodel:keeping 200 factors (discarding 13.424% of energy spectrum)
+INFO:gensim.models.lsimodel:processed documents up to #40000
+INFO:gensim.models.lsimodel:topic #0(18.621): 0.117*"actor" + 0.110*"german" + 0.106*"music" + 0.104*"british" + 0.102*"actress" + 0.101*"french" + 0.101*"singer" + 0.100*"footballer" + 0.096*"league" + 0.096*"king"
+INFO:gensim.models.lsimodel:topic #1(12.812): -0.569*"league" + -0.268*"football" + -0.233*"team" + -0.179*"club" + -0.164*"premier" + -0.162*"division" + -0.150*"cup" + -0.149*"nhl" + -0.130*"championship" + -0.128*"played"
+INFO:gensim.models.lsimodel:topic #2(12.588): 0.329*"album" + 0.254*"band" + 0.197*"music" + 0.163*"released" + 0.162*"song" + -0.160*"footballer" + 0.139*"albums" + 0.134*"chart" + -0.134*"politician" + 0.132*"guitar"
+INFO:gensim.models.lsimodel:topic #3(12.291): 0.391*"river" + 0.269*"county" + 0.168*"district" + -0.146*"album" + -0.145*"actor" + 0.142*"province" + -0.132*"footballer" + -0.131*"actress" + -0.130*"singer" + 0.110*"jpg"
+INFO:gensim.models.lsimodel:topic #4(10.997): -0.601*"river" + -0.321*"county" + 0.179*"emperor" + 0.131*"month" + 0.122*"era" + -0.121*"album" + 0.116*"period" + 0.102*"library" + 0.092*"nengo" + -0.091*"band"
+INFO:gensim.models.lsimodel:preparing a new chunk of documents
+INFO:gensim.models.lsimodel:using 100 extra samples and 2 power iterations
+INFO:gensim.models.lsimodel:1st phase: constructing (26645, 300) action matrix
+INFO:gensim.models.lsimodel:orthonormalizing (26645, 300) action matrix
+INFO:gensim.models.lsimodel:2nd phase: running dense svd on (300, 8356) matrix
+INFO:gensim.models.lsimodel:computing the final decomposition
+INFO:gensim.models.lsimodel:keeping 200 factors (discarding 15.234% of energy spectrum)
+INFO:gensim.models.lsimodel:merging projections: (26645, 200) + (26645, 200)
+INFO:gensim.models.lsimodel:keeping 200 factors (discarding 9.922% of energy spectrum)
+INFO:gensim.models.lsimodel:processed documents up to #48356
+INFO:gensim.models.lsimodel:topic #0(20.130): 0.110*"actor" + 0.107*"album" + 0.105*"music" + 0.105*"movie" + 0.095*"british" + 0.095*"german" + 0.094*"king" + 0.092*"actress" + 0.091*"singer" + 0.089*"league"
+INFO:gensim.models.lsimodel:topic #1(13.799): 0.406*"album" + 0.288*"band" + -0.238*"league" + 0.219*"released" + 0.195*"music" + 0.189*"song" + 0.153*"albums" + 0.150*"guitar" + 0.144*"chart" + 0.126*"vocals"
+INFO:gensim.models.lsimodel:topic #2(13.717): -0.399*"league" + -0.221*"team" + -0.197*"nhl" + -0.186*"football" + -0.181*"championship" + -0.163*"played" + -0.148*"hockey" + -0.129*"cup" + -0.126*"club" + -0.125*"album"
+INFO:gensim.models.lsimodel:topic #3(12.904): 0.326*"river" + 0.245*"county" + -0.189*"actor" + -0.166*"footballer" + -0.164*"actress" + -0.139*"politician" + 0.137*"district" + -0.134*"writer" + -0.127*"singer" + 0.122*"jpg"
+INFO:gensim.models.lsimodel:topic #4(11.651): 0.336*"wrestling" + 0.315*"championship" + 0.264*"match" + 0.261*"wwe" + -0.241*"river" + -0.235*"county" + -0.221*"league" + 0.182*"defeated" + 0.171*"tag" + -0.131*"album"
+
+
+
+
+
+CPU times: user 1min 41s, sys: 3.01 s, total: 1min 44s
+Wall time: 1min 9s
+
+
+
+
+
+
+
+
+The LSI transformation goes from a space of high dimensionality (~TFIDF, tens of thousands) into a space of low dimensionality (a few hundreds; here 200). For this reason it can also seen as dimensionality reduction.
+
+As always, the transformations are applied "lazily", so the resulting output corpus is streamed as well:
+
+
+
+In [22]: 
+
+
+
+print(next(iter(lsi_model[tfidf_model[mm_corpus]])))
+
+
+
+
+
+
+[(0, 0.16631714468299849), (1, -0.036287388906574257), (2, 0.048499765720656562), (3, -0.042612354236578026), (4, 0.010084304715762318), (5, -0.009567831387802898), (6, -0.048913695259492192), (7, -0.00045900473900454939), (8, 0.042252101597092868), (9, -0.020530552649099639), (10, 0.0039853328406968527), (11, 0.029423846752340457), (12, 0.001614017106107998), (13, -0.02637654378584026), (14, -0.055426530595086045), (15, -0.0035285864565004479), (16, 0.0325623585900226), (17, 0.039380380379663696), (18, -0.0016690743161094095), (19, -0.016990987198544315), (20, 0.0025731281328349388), (21, 0.02476178737967593), (22, -0.026677239478974501), (23, -0.039943254371025763), (24, -0.06209892815237536), (25, 0.029877800831571755), (26, 0.027248353575590654), (27, 0.050298220766656208), (28, -0.0081867979142293545), (29, -0.081640547710851899), (30, 0.047652293599810783), (31, 0.057367960030959425), (32, -0.038221532617439345), (33, -0.00077890760436020719), (34, -0.05033222358772102), (35, 0.065751100596788764), (36, -0.022329602026782452), (37, -0.0066967119654308483), (38, -0.047056603132425441), (39, 0.018523242951253766), (40, -0.022420239485444957), (41, 0.065357413072797493), (42, 0.00027533399152406218), (43, -0.043152923516498187), (44, 0.025942345794295215), (45, -0.042917089514263367), (46, -0.031118071454281117), (47, 0.018865965938842415), (48, 0.039018047146724612), (49, -0.017414041148885704), (50, -0.0092648414854218514), (51, -0.011442833067119943), (52, 0.013933258552023601), (53, 0.041087367235170515), (54, -0.00550991252750542), (55, -0.04951399525093296), (56, -0.019352709313220584), (57, 0.051104182074227955), (58, 0.015058504771654515), (59, 0.0200253197826663), (60, -0.039866892886601273), (61, 0.013990280698054736), (62, 0.022664638518755827), (63, 0.059030914478668761), (64, 0.019088481097643974), (65, -0.023627871281205234), (66, 0.0030788062602049204), (67, 0.0094894250554424433), (68, -0.0035419049209845289), (69, -0.020435492895034605), (70, -0.0088458334164425497), (71, -0.00064341020775187795), (72, -0.0088860744416950285), (73, 0.031737596633502688), (74, 0.0083042671359334647), (75, 0.023038982533654526), (76, -0.0097946266402327807), (77, 0.0049700670130214683), (78, 0.01568003626817429), (79, -0.026049316045869565), (80, -0.034179618620747192), (81, -0.019975545809169985), (82, -0.012840801359481485), (83, -0.015529868560919896), (84, -0.010616671445807387), (85, 0.0018824615044074409), (86, 0.027483212834854685), (87, -0.0423449984857385), (88, -0.015137220949897437), (89, -0.0034002649321534101), (90, -0.020890337378940787), (91, 0.010970086014232959), (92, 0.010570331735552866), (93, -0.014956102722983674), (94, -0.011291605288169221), (95, -0.0027571749884275631), (96, 0.00998679212828045), (97, 0.029332755273022058), (98, -0.047454891808374346), (99, -0.0091915112069105385), (100, 0.012164664136640937), (101, -0.0088492510831544233), (102, 0.0070003812612098948), (103, 0.026286535014965855), (104, 0.013165105218266254), (105, -0.043848082929041195), (106, -0.0045136250196287061), (107, -0.026746183478901595), (108, 0.038595183693686953), (109, 0.0024126845741572396), (110, 0.00039215625629080092), (111, 0.01868716720475436), (112, -0.036239370742720059), (113, 0.0052166441419651604), (114, -0.0019552379747073264), (115, 0.017289674195076807), (116, -0.026586508964831383), (117, -0.02376508447539244), (118, 0.0036782747634668822), (119, 0.01451139789995546), (120, -0.0016355883448216785), (121, -0.027812443884426399), (122, -0.001779836689877136), (123, -0.021546774449690012), (124, -0.061907942234949491), (125, 0.0023332467197714275), (126, 0.016333520037910821), (127, 0.02069926208631722), (128, 0.029289361235220385), (129, -0.0025446453550222545), (130, 0.0069332690046049915), (131, 0.0070084717317492736), (132, 0.0072739331834266487), (133, -0.0075349129625063111), (134, 0.00023793419066235117), (135, 0.042374251238552089), (136, -0.028522754880602838), (137, -0.035787549707550138), (138, -0.012958690229709073), (139, -0.012325939673401587), (140, 0.0018101772720235559), (141, 0.010520079216731393), (142, -0.030038306211903707), (143, -0.025929311612668888), (144, 0.001674202343756504), (145, 0.00034888412377334665), (146, -0.021471818128166533), (147, -0.022314117978776821), (148, -0.0010215783305752601), (149, -0.015961945863211705), (150, 0.028803427388083239), (151, -0.033173483901936036), (152, 0.015959908546961582), (153, 0.034415714309847953), (154, 0.0042208872287177301), (155, -0.019034659840180043), (156, -0.011154204290703077), (157, -0.0053518896472850731), (158, -0.018364583433258478), (159, 0.0052692125763301257), (160, 0.017887452559029349), (161, -0.027035833946876548), (162, 0.028591931604784578), (163, 0.016265249396027682), (164, -0.019441310031985296), (165, -0.028845070472923961), (166, 0.021797334246243218), (167, -0.011930792629386074), (168, 0.022836093188584573), (169, -0.044243353824138), (170, -0.0019221186929550165), (171, 0.011734906060957163), (172, -0.00052454052320356846), (173, -0.001447740927517534), (174, -0.014874536733735259), (175, -0.0018548612799228516), (176, -0.0012863491454283766), (177, -0.034345489424845235), (178, -0.0023692179481239607), (179, -0.028459091335590065), (180, -0.0093160374133063415), (181, 0.026929134949435395), (182, 0.030645409371776032), (183, -0.0049694499517949266), (184, 0.011344896001677641), (185, 0.0061905658961183482), (186, -0.0029220810494594018), (187, -0.029187746084455034), (188, 0.019819330508833603), (189, -0.031197576610720625), (190, 0.0090736492751918463), (191, -0.024692969899768071), (192, -0.012819490278248948), (193, 0.017671841938888478), (194, -0.00796988907339642), (195, 0.033612552611643413), (196, 0.010891095188078985), (197, -0.017063671894427961), (198, -0.002614094969482483), (199, 0.0063618557309270086)]
+
+
+
+
+
+
+
+
+We can store this "LSA via TFIDF via bag-of-words" corpus the same way again:
+
+
+
+In [23]: 
+
+
+
+# cache the transformed corpora to disk, for use in later notebooks
+%time gensim.corpora.MmCorpus.serialize('./data/wiki_tfidf.mm', tfidf_model[mm_corpus])
+%time gensim.corpora.MmCorpus.serialize('./data/wiki_lsa.mm', lsi_model[tfidf_model[mm_corpus]])
+# gensim.corpora.MmCorpus.serialize('./data/wiki_lda.mm', lda_model[mm_corpus])
+
+
+
+
+
+
+INFO:gensim.corpora.mmcorpus:storing corpus in Matrix Market format to ./data/wiki_tfidf.mm
+INFO:gensim.matutils:saving sparse matrix to ./data/wiki_tfidf.mm
+INFO:gensim.matutils:PROGRESS: saving document #0
+INFO:gensim.matutils:PROGRESS: saving document #1000
+INFO:gensim.matutils:PROGRESS: saving document #2000
+INFO:gensim.matutils:PROGRESS: saving document #3000
+INFO:gensim.matutils:PROGRESS: saving document #4000
+INFO:gensim.matutils:PROGRESS: saving document #5000
+INFO:gensim.matutils:PROGRESS: saving document #6000
+INFO:gensim.matutils:PROGRESS: saving document #7000
+INFO:gensim.matutils:PROGRESS: saving document #8000
+INFO:gensim.matutils:PROGRESS: saving document #9000
+INFO:gensim.matutils:PROGRESS: saving document #10000
+INFO:gensim.matutils:PROGRESS: saving document #11000
+INFO:gensim.matutils:PROGRESS: saving document #12000
+INFO:gensim.matutils:PROGRESS: saving document #13000
+INFO:gensim.matutils:PROGRESS: saving document #14000
+INFO:gensim.matutils:PROGRESS: saving document #15000
+INFO:gensim.matutils:PROGRESS: saving document #16000
+INFO:gensim.matutils:PROGRESS: saving document #17000
+INFO:gensim.matutils:PROGRESS: saving document #18000
+INFO:gensim.matutils:PROGRESS: saving document #19000
+INFO:gensim.matutils:PROGRESS: saving document #20000
+INFO:gensim.matutils:PROGRESS: saving document #21000
+INFO:gensim.matutils:PROGRESS: saving document #22000
+INFO:gensim.matutils:PROGRESS: saving document #23000
+INFO:gensim.matutils:PROGRESS: saving document #24000
+INFO:gensim.matutils:PROGRESS: saving document #25000
+INFO:gensim.matutils:PROGRESS: saving document #26000
+INFO:gensim.matutils:PROGRESS: saving document #27000
+INFO:gensim.matutils:PROGRESS: saving document #28000
+INFO:gensim.matutils:PROGRESS: saving document #29000
+INFO:gensim.matutils:PROGRESS: saving document #30000
+INFO:gensim.matutils:PROGRESS: saving document #31000
+INFO:gensim.matutils:PROGRESS: saving document #32000
+INFO:gensim.matutils:PROGRESS: saving document #33000
+INFO:gensim.matutils:PROGRESS: saving document #34000
+INFO:gensim.matutils:PROGRESS: saving document #35000
+INFO:gensim.matutils:PROGRESS: saving document #36000
+INFO:gensim.matutils:PROGRESS: saving document #37000
+INFO:gensim.matutils:PROGRESS: saving document #38000
+INFO:gensim.matutils:PROGRESS: saving document #39000
+INFO:gensim.matutils:PROGRESS: saving document #40000
+INFO:gensim.matutils:PROGRESS: saving document #41000
+INFO:gensim.matutils:PROGRESS: saving document #42000
+INFO:gensim.matutils:PROGRESS: saving document #43000
+INFO:gensim.matutils:PROGRESS: saving document #44000
+INFO:gensim.matutils:PROGRESS: saving document #45000
+INFO:gensim.matutils:PROGRESS: saving document #46000
+INFO:gensim.matutils:PROGRESS: saving document #47000
+INFO:gensim.matutils:PROGRESS: saving document #48000
+INFO:gensim.matutils:saved 48356x26645 matrix, density=0.368% (4743136/1288445620)
+INFO:gensim.corpora.indexedcorpus:saving MmCorpus index to ./data/wiki_tfidf.mm.index
+INFO:gensim.corpora.mmcorpus:storing corpus in Matrix Market format to ./data/wiki_lsa.mm
+INFO:gensim.matutils:saving sparse matrix to ./data/wiki_lsa.mm
+INFO:gensim.matutils:PROGRESS: saving document #0
+INFO:gensim.matutils:PROGRESS: saving document #1000
+INFO:gensim.matutils:PROGRESS: saving document #2000
+INFO:gensim.matutils:PROGRESS: saving document #3000
+INFO:gensim.matutils:PROGRESS: saving document #4000
+INFO:gensim.matutils:PROGRESS: saving document #5000
+INFO:gensim.matutils:PROGRESS: saving document #6000
+INFO:gensim.matutils:PROGRESS: saving document #7000
+INFO:gensim.matutils:PROGRESS: saving document #8000
+INFO:gensim.matutils:PROGRESS: saving document #9000
+INFO:gensim.matutils:PROGRESS: saving document #10000
+INFO:gensim.matutils:PROGRESS: saving document #11000
+INFO:gensim.matutils:PROGRESS: saving document #12000
+INFO:gensim.matutils:PROGRESS: saving document #13000
+INFO:gensim.matutils:PROGRESS: saving document #14000
+INFO:gensim.matutils:PROGRESS: saving document #15000
+INFO:gensim.matutils:PROGRESS: saving document #16000
+INFO:gensim.matutils:PROGRESS: saving document #17000
+INFO:gensim.matutils:PROGRESS: saving document #18000
+INFO:gensim.matutils:PROGRESS: saving document #19000
+INFO:gensim.matutils:PROGRESS: saving document #20000
+INFO:gensim.matutils:PROGRESS: saving document #21000
+INFO:gensim.matutils:PROGRESS: saving document #22000
+INFO:gensim.matutils:PROGRESS: saving document #23000
+INFO:gensim.matutils:PROGRESS: saving document #24000
+INFO:gensim.matutils:PROGRESS: saving document #25000
+INFO:gensim.matutils:PROGRESS: saving document #26000
+INFO:gensim.matutils:PROGRESS: saving document #27000
+INFO:gensim.matutils:PROGRESS: saving document #28000
+INFO:gensim.matutils:PROGRESS: saving document #29000
+INFO:gensim.matutils:PROGRESS: saving document #30000
+INFO:gensim.matutils:PROGRESS: saving document #31000
+INFO:gensim.matutils:PROGRESS: saving document #32000
+INFO:gensim.matutils:PROGRESS: saving document #33000
+INFO:gensim.matutils:PROGRESS: saving document #34000
+INFO:gensim.matutils:PROGRESS: saving document #35000
+INFO:gensim.matutils:PROGRESS: saving document #36000
+INFO:gensim.matutils:PROGRESS: saving document #37000
+INFO:gensim.matutils:PROGRESS: saving document #38000
+INFO:gensim.matutils:PROGRESS: saving document #39000
+INFO:gensim.matutils:PROGRESS: saving document #40000
+INFO:gensim.matutils:PROGRESS: saving document #41000
+INFO:gensim.matutils:PROGRESS: saving document #42000
+INFO:gensim.matutils:PROGRESS: saving document #43000
+INFO:gensim.matutils:PROGRESS: saving document #44000
+INFO:gensim.matutils:PROGRESS: saving document #45000
+INFO:gensim.matutils:PROGRESS: saving document #46000
+INFO:gensim.matutils:PROGRESS: saving document #47000
+INFO:gensim.matutils:PROGRESS: saving document #48000
+INFO:gensim.matutils:saved 48356x200 matrix, density=100.000% (9671200/9671200)
+INFO:gensim.corpora.indexedcorpus:saving MmCorpus index to ./data/wiki_lsa.mm.index
+
+
+
+
+
+CPU times: user 1min 17s, sys: 551 ms, total: 1min 17s
+Wall time: 1min 17s
+CPU times: user 2min 24s, sys: 1.02 s, total: 2min 25s
+Wall time: 2min 25s
+
+
+
+
+
+
+
+
+(you can also gzip/bzip2 these .mm files to save space, as gensim can work with zipped input transparently)
+
+Persisting a transformed corpus to disk makes sense if we want to iterate over it multiple times and the transformation is costly. As before, the saved result is indistinguishable from when it's computed on the fly, so this is effectively a form of "corpus caching":
+
+
+
+In [24]: 
+
+
+
+tfidf_corpus = gensim.corpora.MmCorpus('./data/wiki_tfidf.mm')
+# `tfidf_corpus` is now exactly the same as `tfidf_model[wiki_corpus]`
+print(tfidf_corpus)
+
+lsi_corpus = gensim.corpora.MmCorpus('./data/wiki_lsa.mm')
+# and `lsi_corpus` now equals `lsi_model[tfidf_model[wiki_corpus]]` = `lsi_model[tfidf_corpus]`
+print(lsi_corpus)
+
+
+
+
+
+
+INFO:gensim.corpora.indexedcorpus:loaded corpus index from ./data/wiki_tfidf.mm.index
+INFO:gensim.matutils:initializing corpus reader from ./data/wiki_tfidf.mm
+INFO:gensim.matutils:accepted corpus with 48356 documents, 26645 features, 4743136 non-zero entries
+INFO:gensim.corpora.indexedcorpus:loaded corpus index from ./data/wiki_lsa.mm.index
+INFO:gensim.matutils:initializing corpus reader from ./data/wiki_lsa.mm
+INFO:gensim.matutils:accepted corpus with 48356 documents, 200 features, 9671200 non-zero entries
+
+
+
+
+
+MmCorpus(48356 documents, 26645 features, 4743136 non-zero entries)
+MmCorpus(48356 documents, 200 features, 9671200 non-zero entries)
+
+
+
+
+
+
+
+
+Transforming unseen documents
+
+
+
+
+
+
+We can use the trained models to transform new, unseen documents into the semantic space:
+
+
+
+In [25]: 
+
+
+
+text = "A blood cell, also called a hematocyte, is a cell produced by hematopoiesis and normally found in blood."
+
+# transform text into the bag-of-words space
+bow_vector = id2word_wiki.doc2bow(tokenize(text))
+print([(id2word_wiki[id], count) for id, count in bow_vector])
+
+
+
+
+
+
+[(u'blood', 2), (u'normally', 1), (u'produced', 1), (u'cell', 2)]
+
+
+
+
+
+In [26]: 
+
+
+
+# transform into LDA space
+lda_vector = lda_model[bow_vector]
+print(lda_vector)
+# print the document's single most prominent LDA topic
+print(lda_model.print_topic(max(lda_vector, key=lambda item: item[1])[0]))
+
+
+
+
+
+
+[(0, 0.014286925946835323), (1, 0.87141547921632379), (2, 0.014286360721254065), (3, 0.014286999355157072), (4, 0.014285788059594635), (5, 0.014292086440228948), (6, 0.014286101926574092), (7, 0.014286649663832069), (8, 0.01428722573067776), (9, 0.014286382939522325)]
+0.020*rgb + 0.020*hex + 0.011*color + 0.010*blood + 0.008*body + 0.007*disease + 0.006*person + 0.006*blue + 0.006*red + 0.005*green
+
+
+
+
+
+
+
+
+Exercise (5 min): print text transformed into TFIDF space.
+
+
+
+
+
+
+For stacked transformations, apply the same stack during transformation as was applied during training:
+
+
+
+In [27]: 
+
+
+
+# transform into LSI space
+lsi_vector = lsi_model[tfidf_model[bow_vector]]
+print(lsi_vector)
+# print the document's single most prominent LSI topic (not interpretable like LDA!)
+print(lsi_model.print_topic(max(lsi_vector, key=lambda item: abs(item[1]))[0]))
+
+
+
+
+
+
+[(0, 0.023073570215013738), (1, 0.014088249693166351), (2, 0.0034177716976841561), (3, 0.024762792489794259), (4, 0.030877950870625111), (5, 0.032727479058177959), (6, 0.0062187378721511224), (7, 0.0005705478690865856), (8, -0.016300364079762056), (9, 0.0019830263388809785), (10, 0.0020977621621493248), (11, 0.024437846416960535), (12, 0.017469260662519678), (13, 0.027115892101080584), (14, 0.011344124564613992), (15, 0.043699752337972318), (16, 0.0092138064099946196), (17, -0.0047254728228064676), (18, 0.020149181079518977), (19, 0.0093126275820839006), (20, -0.0028462892266140748), (21, -0.015559189162721214), (22, -0.044527580875961481), (23, 0.027301079501427836), (24, -0.063751679149158025), (25, -0.04078887492064219), (26, -0.039275046232111477), (27, 0.00023271790589427877), (28, 0.003228644172437622), (29, -0.0068643553928250441), (30, -0.0029140003405393471), (31, -0.02236516362832202), (32, -0.033416219450735446), (33, -0.030865107216227101), (34, 0.064371241235141957), (35, -0.056636946973415661), (36, -0.0099929571425462702), (37, 0.037405519702526799), (38, 0.044379991687203579), (39, 0.095139510714029984), (40, -0.06940471083820822), (41, 0.029400806242527978), (42, -0.037039620416410027), (43, -0.028344577038672551), (44, 0.030759275224020624), (45, -0.095835818602352046), (46, 0.022952387678715103), (47, 0.091233244102377584), (48, 0.00065019708970485285), (49, -0.011216987193293476), (50, -0.082762495607073133), (51, -0.074490877506917713), (52, 0.086321484045953079), (53, -0.045314639633725097), (54, 0.18825485963809097), (55, 0.023391057468861807), (56, -0.074689312779355879), (57, -0.048207334501839054), (58, 0.091037733907165116), (59, -0.047106067096818166), (60, 0.034435227509590167), (61, -0.022081856400091558), (62, -0.026284672257648023), (63, 0.020753879145969541), (64, -0.063678389506680616), (65, 0.089681168003326345), (66, 0.049002267053582432), (67, 0.02382424892197282), (68, 0.045721846494021896), (69, 0.088683845719919149), (70, -0.030910753594443251), (71, 0.003801980783155065), (72, -0.0067490981752589222), (73, -0.032931710680081973), (74, -0.03793289225123337), (75, 0.028255132141198173), (76, 0.00653223179139132), (77, 0.0047142133481579279), (78, 0.0016165401658526611), (79, 0.010989913508920696), (80, 0.0035059896338344096), (81, -0.033162720295565086), (82, 0.023640651572534949), (83, -0.011546777148738273), (84, -0.058477691225414977), (85, -0.017911609050505164), (86, 0.039307969744710236), (87, -0.01035752750122427), (88, 0.048374701120610777), (89, 0.0069871823988322057), (90, 0.027599136421919468), (91, 0.055945221541716529), (92, -0.032882833903212803), (93, 0.020861578833550477), (94, -0.036551258122536748), (95, 0.0071777287456482979), (96, -0.018018650588291749), (97, 0.047612339155964814), (98, -0.012245856179307207), (99, 0.018325511157753771), (100, 0.034837069667013804), (101, -0.027534351436702229), (102, -0.018236326456280656), (103, 0.020477189184756876), (104, -0.0056182779160652806), (105, 0.014494752927865555), (106, 0.010042190902494755), (107, 0.0024253887723259589), (108, 0.0074997987198214336), (109, -0.0054837989258610638), (110, 0.04207416938748014), (111, -0.080142185305828562), (112, 0.028792175447430141), (113, -0.028655937477557444), (114, -0.021359894992716354), (115, 0.023654619350279044), (116, 0.022365790423015085), (117, 0.0071523485934635554), (118, 0.038723043535871374), (119, 0.0022068736691175216), (120, -0.010867114475647524), (121, 0.018453544848285128), (122, 0.055181639690374817), (123, 0.014615190218974587), (124, -0.027675901681824454), (125, 0.013142596052732585), (126, 0.0050928448866013054), (127, -0.0026890091757787726), (128, -0.0089455802945154102), (129, 0.0061489224483459934), (130, -0.0035533710999758692), (131, 0.0038549682031383294), (132, -0.03679245789816854), (133, -0.036471674428371195), (134, -0.015561112754919303), (135, 0.02077620607575038), (136, 0.064037784824890032), (137, -0.022070691529248732), (138, 0.035838996809477781), (139, -0.021653826470010833), (140, -0.047152034486778599), (141, 0.012436100683584719), (142, 0.031243500889158542), (143, 0.014492833662137211), (144, -0.005429978839081865), (145, 0.010977804049491321), (146, 0.00010085142727661069), (147, -0.034126678253711261), (148, 0.0058529975241160756), (149, -0.042873024170411167), (150, -0.025912227897371402), (151, -0.00035749054778024068), (152, 0.034370413900843562), (153, -0.0088238021480119243), (154, 0.0023780024923325889), (155, 0.0019781116660507192), (156, 0.0035906836667879524), (157, -0.019585897013521557), (158, 0.057513829352295029), (159, -0.028241097316859674), (160, -0.051710624114250522), (161, 0.029890476373334446), (162, -0.0035025668945597201), (163, -0.02430993474939673), (164, -0.0017373048416237432), (165, 0.030613031165119025), (166, -0.033675038832427659), (167, -0.012340041580906817), (168, 0.014584324436810236), (169, 0.055111608352095706), (170, 0.012926226107435958), (171, 0.030223316624547143), (172, -0.012203888138656667), (173, -0.022224106385660206), (174, -0.017117338445149871), (175, -0.047314260419273897), (176, 0.028922614902986046), (177, -0.017976688869323857), (178, 0.073887891781189124), (179, -0.012872634045020603), (180, -0.047972759871970298), (181, 0.0068849132759171636), (182, -0.019130846435125682), (183, -0.037136217050774654), (184, 0.0310776604874205), (185, 0.043716304563130207), (186, -0.021604693013868456), (187, 0.0050859071970741458), (188, 0.013208724029153176), (189, -0.017711889721715664), (190, 0.004496986041856367), (191, 0.012831248972548276), (192, -0.010364050074606737), (193, 0.0310331426597221), (194, 0.057674284431526002), (195, -0.0015131675602084466), (196, 0.0683813644550611), (197, -0.014558828397090879), (198, -0.013193501337448402), (199, 0.038421719277497449)]
+0.286*"bridge" + 0.229*"song" + 0.225*"cells" + 0.190*"cell" + -0.170*"orchestra" + -0.119*"emperor" + 0.117*"party" + 0.115*"music" + -0.108*"australia" + -0.107*"god"
+
+
+
+
+
+
+
+
+Model persistence
+
+
+
+
+
+
+Gensim objects have save/load methods for persisting a model to disk, so it can be re-used later (or sent over network to a different computer, or whatever):
+
+
+
+In [28]: 
+
+
+
+# store all trained models to disk
+lda_model.save('./data/lda_wiki.model')
+lsi_model.save('./data/lsi_wiki.model')
+tfidf_model.save('./data/tfidf_wiki.model')
+id2word_wiki.save('./data/wiki.dictionary')
+
+
+
+
+
+
+INFO:gensim.utils:saving LdaState object under ./data/lda_wiki.model.state, separately None
+INFO:gensim.utils:saving LdaModel object under ./data/lda_wiki.model, separately None
+INFO:gensim.utils:not storing attribute state
+INFO:gensim.utils:not storing attribute dispatcher
+INFO:gensim.utils:saving Projection object under ./data/lsi_wiki.model.projection, separately None
+INFO:gensim.utils:saving LsiModel object under ./data/lsi_wiki.model, separately None
+INFO:gensim.utils:not storing attribute projection
+INFO:gensim.utils:not storing attribute dispatcher
+INFO:gensim.utils:saving TfidfModel object under ./data/tfidf_wiki.model, separately None
+INFO:gensim.utils:saving Dictionary object under ./data/wiki.dictionary, separately None
+
+
+
+
+
+In [29]: 
+
+
+
+# load the same model back; the result is equal to `lda_model`
+same_lda_model = gensim.models.LdaModel.load('./data/lda_wiki.model')
+
+
+
+
+
+
+INFO:gensim.utils:loading LdaModel object from ./data/lda_wiki.model
+INFO:gensim.utils:setting ignored attribute state to None
+INFO:gensim.utils:setting ignored attribute dispatcher to None
+INFO:gensim.utils:loading LdaModel object from ./data/lda_wiki.model.state
+
+
+
+
+
+
+
+
+These methods are optimized for storing large models; internal matrices that consume a lot of RAM are mmap'ed in read-only mode. This allows "sharing" a single model between several processes, through the OS's virtual memory management.
+
+
+
+
+
+
+Evaluation
+
+
+
+
+
+
+Topic modeling is an unsupervised task; we do not know in advance what the topics ought to look like. This makes evaluation tricky: whereas in supervised learning (classification, regression) we simply compare predicted labels to expected labels, there are no "expected labels" in topic modeling.
+
+Each topic modeling method (LSI, LDA...) its own way of measuring internal quality (perplexity, reconstruction error...). But these are an artifact of the particular approach taken (bayesian training, matrix factorization...), and mostly of academic interest. There's no way to compare such scores across different types of topic models, either. The best way to really evaluate quality of unsupervised tasks is to evaluate how they improve the superordinate task, the one we're actually training them for.
+
+For example, when the ultimate goal is to retrieve semantically similar documents, we manually tag a set of similar documents and then see how well a given semantic model maps those similar documents together.
+
+Such manual tagging can be resource intensive, so people hae been looking for clever ways to automate it. In Reading tea leaves: How humans interpret topic models, Wallach&al suggest a "word intrusion" method that works well for models where the topics are meant to be "human interpretable", such as LDA. For each trained topic, they take its first ten words, then substitute one of them with another, randomly chosen word (intruder!) and see whether a human can reliably tell which one it was. If so, the trained topic is topically coherent (good); if not, the topic has no discernible theme (bad):
+
+
+
+In [30]: 
+
+
+
+# select top 50 words for each of the 20 LDA topics
+top_words = [[word for _, word in lda_model.show_topic(topicno, topn=50)] for topicno in range(lda_model.num_topics)]
+print(top_words)
+
+
+
+
+
+
+[[u'album', u'band', u'released', u'movie', u'music', u'island', u'york', u'award', u'series', u'song', u'won', u'albums', u'president', u'game', u'rock', u'british', u'england', u'king', u'popular', u'video', u'sold', u'million', u'songs', u'awards', u'married', u'tour', u'jackson', u'live', u'mother', u'father', u'career', u'movies', u'australia', u'games', u'said', u'came', u'left', u'white', u'home', u'death', u'went', u'ford', u'got', u'single', u'bush', u'children', u'record', u'played', u'george', u'love'], [u'rgb', u'hex', u'color', u'blood', u'body', u'disease', u'person', u'blue', u'red', u'green', u'cells', u'light', u'pink', u'heart', u'bc', u'woman', u'web', u'women', u'purple', u'cause', u'colors', u'diseases', u'abortion', u'sex', u'cancer', u'man', u'crayola', u'ff', u'doctors', u'yellow', u'penis', u'malaria', u'men', u'means', u'pain', u'male', u'violet', u'com', u'orange', u'immune', u'medical', u'sexual', u'types', u'causes', u'semen', u'common', u'magenta', u'bacteria', u'brain', u'dark'], [u'god', u'tower', u'mast', u'transmission', u'left', u'book', u'books', u'believe', u'school', u'mount', u'church', u'jesus', u'said', u'party', u'bible', u'earth', u'religion', u'built', u'al', u'east', u'align', u'country', u'muslims', u'things', u'christian', u'building', u'middle', u'largest', u'children', u'written', u'roman', u'ancient', u'radio', u'kansas', u'empire', u'cities', u'live', u'began', u'father', u'july', u'religious', u'moon', u'death', u'man', u'estimate', u'holy', u'religions', u'government', u'today', u'king'], [u'light', u'game', u'league', u'earth', u'energy', u'example', u'player', u'team', u'games', u'football', u'point', u'space', u'numbers', u'mass', u'players', u'universe', u'speed', u'things', u'theory', u'sun', u'object', u'park', u'line', u'play', u'means', u'distance', u'africa', u'ball', u'right', u'field', u'physics', u'matter', u'club', u'force', u'black', u'stars', u'star', u'premier', u'moving', u'teams', u'change', u'units', u'position', u'particles', u'special', u'atoms', u'electrons', u'iron', u'scientists', u'big'], [u'actor', u'german', u'british', u'singer', u'french', u'footballer', u'actress', u'writer', u'politician', u'player', u'italian', u'president', u'musician', u'composer', u'king', u'ii', u'minister', u'russian', u'prime', u'canadian', u'japanese', u'director', u'poet', u'battle', u'governor', u'france', u'william', u'spanish', u'general', u'emperor', u'charles', u'killing', u'painter', u'songwriter', u'george', u'movie', u'henry', u'england', u'scottish', u'james', u'physicist', u'robert', u'queen', u'dutch', u'mathematician', u'leader', u'austrian', u'swedish', u'ice', u'producer'], [u'water', u'jpg', u'bridge', u'species', u'image', u'animals', u'live', u'food', u'plants', u'air', u'birds', u'mario', u'sea', u'eat', u'file', u'living', u'plant', u'land', u'body', u'chemical', u'tree', u'cell', u'grow', u'trees', u'common', u'inside', u'cells', u'white', u'makes', u'america', u'largest', u'island', u'animal', u'built', u'things', u'forest', u'types', u'parts', u'form', u'places', u'fruit', u'example', u'fish', u'big', u'ground', u'compounds', u'leaves', u'evolution', u'eggs', u'london'], [u'president', u'government', u'country', u'union', u'july', u'party', u'korea', u'april', u'army', u'countries', u'germany', u'british', u'december', u'international', u'al', u'january', u'usa', u'soviet', u'february', u'independence', u'russia', u'baltimore', u'election', u'kingdom', u'france', u'military', u'civil', u'republic', u'elected', u'french', u'usb', u'washington', u'nations', u'capital', u'killed', u'ii', u'japan', u'britain', u'democratic', u'general', u'november', u'september', u'vice', u'virginia', u'rights', u'house', u'october', u'political', u'minister', u'august'], [u'language', u'word', u'languages', u'river', u'windows', u'words', u'means', u'country', u'internet', u'example', u'lake', u'church', u'countries', u'information', u'software', u'microsoft', u'latin', u'version', u'computers', u'person', u'things', u'population', u'free', u'web', u'program', u'pope', u'million', u'written', u'operating', u'spoken', u'speak', u'uses', u'parts', u'file', u'europe', u'america', u'programs', u'largest', u'catholic', u'data', u'today', u'came', u'spanish', u'change', u'say', u'republic', u'rivers', u'user', u'released', u'greek'], [u'music', u'person', u'countries', u'things', u'country', u'government', u'money', u'china', u'good', u'example', u'think', u'wrote', u'say', u'word', u'said', u'means', u'popular', u'chinese', u'human', u'want', u'common', u'fish', u'include', u'thought', u'right', u'ideas', u'modern', u'power', u'women', u'today', u'food', u'man', u'play', u'society', u'political', u'lot', u'capital', u'social', u'instruments', u'ancient', u'age', u'help', u'groups', u'written', u'bass', u'period', u'making', u'guitar', u'types', u'law'], [u'january', u'november', u'december', u'february', u'october', u'august', u'april', u'september', u'actor', u'movie', u'july', u'german', u'germany', u'rural', u'actress', u'president', u'king', u'singer', u'love', u'television', u'movies', u'writer', u'british', u'calendar', u'award', u'chicago', u'disney', u'french', u'film', u'france', u'minister', u'band', u'george', u'ii', u'paul', u'rock', u'kingdom', u'prime', u'urban', u'roman', u'man', u'james', u'music', u'director', u'william', u'events', u'bavaria', u'musician', u'japan', u'india']]
+
+
+
+
+
+In [31]: 
+
+
+
+# get all top 50 words in all 20 topics, as one large set
+all_words = set(itertools.chain.from_iterable(top_words))
+
+print("Can you spot the misplaced word in each topic?")
+
+# for each topic, replace a word at a different index, to make it more interesting
+replace_index = np.random.randint(0, 10, lda_model.num_topics)
+
+replacements = []
+for topicno, words in enumerate(top_words):
+    other_words = all_words.difference(words)
+    replacement = np.random.choice(list(other_words))
+    replacements.append((words[replace_index[topicno]], replacement))
+    words[replace_index[topicno]] = replacement
+    print("%i: %s" % (topicno, ' '.join(words[:10])))
+
+
+
+
+
+
+Can you spot the misplaced word in each topic?
+0: album band released books music island york award series song
+1: rgb hex color blood body disease person blue red austrian
+2: god tower mast transmission left book books believe footballer mount
+3: tour game league earth energy example player team games football
+4: land german british singer french footballer actress writer politician player
+5: water jpg bridge species image animals field food plants air
+6: president government country union york party korea april army countries
+7: language word languages river iron words means country internet example
+8: music person countries things country government bible china good example
+9: january plant december february october august april september actor movie
+
+
+
+
+
+In [32]: 
+
+
+
+print("Actual replacements were:")
+print(list(enumerate(replacements)))
+
+
+
+
+
+
+Actual replacements were:
+[(0, (u'movie', u'books')), (1, (u'green', u'austrian')), (2, (u'school', u'footballer')), (3, (u'light', u'tour')), (4, (u'actor', u'land')), (5, (u'live', u'field')), (6, (u'july', u'york')), (7, (u'windows', u'iron')), (8, (u'money', u'bible')), (9, (u'november', u'plant'))]
+
+
+
+
+
+
+
+
+We can also use a different trick, one which doesn't require manual tagging or "eyeballing" (resource intensive) and doesn't limit the evaluation to only interpretable models. We'll split each document into two parts, and check that 1) topics of the first half are similar to topics of the second 2) halves of different documents are mostly dissimilar:
+
+
+
+In [33]: 
+
+
+
+# evaluate on 1k documents **not** used in LDA training
+doc_stream = (tokens for _, tokens in iter_wiki('./data/simplewiki-20140623-pages-articles.xml.bz2'))  # generator
+test_docs = list(itertools.islice(doc_stream, 8000, 9000))
+
+
+
+
+In [34]: 
+
+
+
+def intra_inter(model, test_docs, num_pairs=10000):
+    # split each test document into two halves and compute topics for each half
+    part1 = [model[id2word_wiki.doc2bow(tokens[: len(tokens) / 2])] for tokens in test_docs]
+    part2 = [model[id2word_wiki.doc2bow(tokens[len(tokens) / 2 :])] for tokens in test_docs]
+    
+    # print computed similarities (uses cossim)
+    print("average cosine similarity between corresponding parts (higher is better):")
+    print(np.mean([gensim.matutils.cossim(p1, p2) for p1, p2 in zip(part1, part2)]))
+
+    random_pairs = np.random.randint(0, len(test_docs), size=(num_pairs, 2))
+    print("average cosine similarity between 10,000 random parts (lower is better):")    
+    print(np.mean([gensim.matutils.cossim(part1[i[0]], part2[i[1]]) for i in random_pairs]))
+
+
+
+
+In [35]: 
+
+
+
+print("LDA results:")
+intra_inter(lda_model, test_docs)
+
+
+
+
+
+
+LDA results:
+average cosine similarity between corresponding parts (higher is better):
+0.776225069646
+average cosine similarity between 10,000 random parts (lower is better):
+0.254734527925
+
+
+
+
+
+In [36]: 
+
+
+
+print("LSI results:")
+intra_inter(lsi_model, test_docs)
+
+
+
+
+
+
+LSI results:
+average cosine similarity between corresponding parts (higher is better):
+0.606533434328
+average cosine similarity between 10,000 random parts (lower is better):
+0.0748434974254
+
+
+
+
+
+
+
+
+Summary
+
+
+
+
+
+
+In this notebook, we saw how to:
+•create an id => word mapping, aka dictionary
+•transform a document into a bag-of-word vector, using a dictionary
+•transform a stream of documents into a stream of vectors
+•transform between vector streams, using topic models
+•store and save trained models, for persistency
+•use manual and semi-automated methods to evaluate quality of a topic model
+
+
+
+
+
+
+In this notebook, we've used a smallish simplewiki-20140623-pages-articles.xml.bz2 file, for time reasons. You can run exactly the same code on the full Wikipedia dump too [BZ2 10.2GB] -- the same format is the same. Our streamed approach ensures that RAM footprint of the processing stays constant. There's actually a script in gensim that does all these steps for you, and uses parallelization (multiprocessing) for faster execution, see Experiments on the English Wikipedia.
+
+
+
+
+
+
+Next
+
+
+
+
+
+
+In the next notebook, we'll see how to the index semantically transformed corpora and run queries against the index.
+
+Continue by opening the next ipython notebook, 3 - Indexing and Retrieval.
